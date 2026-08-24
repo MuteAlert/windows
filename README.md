@@ -30,6 +30,8 @@ microphone widget without Windhawk or Explorer injection.
   shortcuts, the taskbar, and Settings windows.
 - Settings stored at `%LOCALAPPDATA%\MuteAlert\settings.ini`.
 - Optional per-user automatic startup.
+- Optional daily GitHub release check with pre-release support, a manual
+  **Check now** action, and a direct link to newer releases.
 
 Middle-click either icon to open Settings. When a call is active, right-click
 the microphone icon or call icon to toggle the active call microphone. With no
@@ -77,6 +79,15 @@ mute.
 
 See [HEADSET_ADAPTERS.md](HEADSET_ADAPTERS.md) for the provider architecture,
 privacy rules for diagnostics, and instructions for adding vendor protocols.
+
+## Update checks
+
+MuteAlert can make an anonymous request to GitHub's public releases API at
+startup when the previous successful check is at least 24 hours old. No GitHub
+account or access token is used. Automatic checks and inclusion of pre-release
+versions can be changed on the Updates page in Settings; that page also offers
+a manual check. MuteAlert only notifies and links to the release—it never
+downloads or installs an update without the user.
 
 ## License
 

@@ -31,13 +31,16 @@
 #include <strsafe.h>
 #include <tlhelp32.h>
 #include <UIAutomation.h>
+#include <winhttp.h>
 
 #include "headset_adapters.h"
+#include "version.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <commdlg.h>
+#include <cstdlib>
 #include <cstdarg>
 #include <cstdio>
 #include <cwctype>
@@ -115,10 +118,15 @@ static constexpr UINT kTrayCallback = WM_APP + 1;
 static constexpr UINT kStateChanged = WM_APP + 2;
 static constexpr UINT kWheelMessage = WM_APP + 3;
 static constexpr UINT kShowSettingsMessage = WM_APP + 4;
+static constexpr UINT kUpdateCheckCompleted = WM_APP + 5;
 static constexpr UINT_PTR kStandardHidTimer = 1;
 static constexpr UINT kMicIconId = 1;
 static constexpr UINT kCallIconId = 2;
 static constexpr int kAppIconResourceId = 101;
+static constexpr ULONGLONG kUpdateCheckIntervalSeconds = 24ULL * 60 * 60;
+static constexpr ULONGLONG kUpdateRetryIntervalSeconds = 60ULL * 60;
+static constexpr wchar_t kReleasesApiPath[] =
+    L"/repos/MuteAlert/windows/releases?per_page=20";
 static const GUID kMicIconGuid = {0x16ccb84d, 0xbab1, 0x47ef,
                                   {0x85, 0x62, 0xe1, 0x54, 0xeb, 0xd9, 0x31,
                                    0x1a}};
@@ -146,6 +154,8 @@ struct Settings {
     int peakSensitivity = 150;
     bool showCallStateIcon = true;
     bool startWithWindows = false;
+    bool checkForUpdates = true;
+    bool includePrereleaseUpdates = true;
 
     std::wstring headsetMode = L"full";
     bool headsetSyncWindows = true;
@@ -194,6 +204,7 @@ static bool g_callIconAdded;
 static bool g_previousWarning;
 static UINT g_taskbarCreated;
 static HANDLE g_singleInstance;
+static std::atomic<bool> g_updateBalloonActive{false};
 
 static std::atomic<bool> g_exiting{false};
 static std::atomic<int> g_audioRole{eConsole};
@@ -213,6 +224,10 @@ static std::atomic<int> g_pendingMuteSet{-1};
 static std::atomic<int> g_pendingSlackCommand{-1};
 static std::atomic<int> g_pendingTeamsCommand{-1};
 static std::atomic<int> g_pendingZoomCommand{-1};
+static std::atomic<bool> g_checkForUpdates{true};
+static std::atomic<bool> g_includePrereleaseUpdates{true};
+static std::atomic<bool> g_manualUpdateCheck{false};
+static std::atomic<bool> g_manualIncludePrereleaseUpdates{true};
 static std::atomic<bool> g_slackActive{false};
 static std::atomic<bool> g_slackMuted{false};
 static std::atomic<bool> g_slackWarning{false};
@@ -228,6 +243,25 @@ static std::atomic<bool> g_zoomWarning{false};
 static std::atomic<HWND> g_zoomWindow{nullptr};
 static SRWLOCK g_deviceNameLock = SRWLOCK_INIT;
 static std::wstring g_deviceName = L"No microphone available";
+
+enum class UpdateCheckState {
+    NotChecked,
+    Checking,
+    UpToDate,
+    Available,
+    Failed,
+};
+
+struct UpdateStatus {
+    UpdateCheckState state = UpdateCheckState::NotChecked;
+    std::wstring version;
+    std::wstring releaseUrl;
+};
+
+static SRWLOCK g_updateStatusLock = SRWLOCK_INIT;
+static UpdateStatus g_updateStatus;
+static std::wstring g_lastNotifiedVersion;
+static std::atomic<ULONGLONG> g_lastUpdateCheckTime{0};
 
 struct HeadsetStatus {
     bool detected = false;
@@ -261,6 +295,8 @@ static HANDLE g_wakeEvent;
 static HANDLE g_audioThread;
 static HANDLE g_callThread;
 static HANDLE g_headsetThread;
+static HANDLE g_updateThread;
+static HANDLE g_updateWakeEvent;
 
 static std::wstring ReadIniString(PCWSTR section, PCWSTR key,
                                   PCWSTR fallback) {
@@ -296,6 +332,19 @@ static void WriteIniBool(PCWSTR section, PCWSTR key, bool value) {
     WriteIniInt(section, key, value ? 1 : 0);
 }
 
+static ULONGLONG ReadIniUInt64(PCWSTR section, PCWSTR key,
+                              ULONGLONG fallback) {
+    std::wstring value = ReadIniString(section, key, L"");
+    if (value.empty()) return fallback;
+    wchar_t* end = nullptr;
+    unsigned long long parsed = wcstoull(value.c_str(), &end, 10);
+    return end && *end == L'\0' ? parsed : fallback;
+}
+
+static void WriteIniUInt64(PCWSTR section, PCWSTR key, ULONGLONG value) {
+    WriteIniString(section, key, std::to_wstring(value));
+}
+
 static void LoadSettings() {
     Settings defaults;
     std::wstring role = ReadIniString(L"General", L"DeviceRole", L"console");
@@ -316,6 +365,15 @@ static void LoadSettings() {
         L"General", L"ShowCallIcon", defaults.showCallStateIcon);
     g_settings.startWithWindows = ReadIniBool(
         L"General", L"StartWithWindows", defaults.startWithWindows);
+    g_settings.checkForUpdates = ReadIniBool(
+        L"Updates", L"CheckAutomatically", defaults.checkForUpdates);
+    g_settings.includePrereleaseUpdates = ReadIniBool(
+        L"Updates", L"IncludePrereleases",
+        defaults.includePrereleaseUpdates);
+    g_lastNotifiedVersion =
+        ReadIniString(L"Updates", L"LastNotifiedVersion", L"");
+    g_lastUpdateCheckTime.store(
+        ReadIniUInt64(L"Updates", L"LastSuccessfulCheck", 0));
 
     auto loadApp = [&](PCWSTR section, bool& warning, bool& cue, bool& toggle,
                        std::wstring& mutedText, std::wstring& callText,
@@ -358,6 +416,9 @@ static void LoadSettings() {
     g_peakSensitivity.store(g_settings.peakSensitivity);
     g_forceVolume.store(g_settings.forceVolume);
     g_forcedVolume.store(g_settings.forcedVolume);
+    g_checkForUpdates.store(g_settings.checkForUpdates);
+    g_includePrereleaseUpdates.store(
+        g_settings.includePrereleaseUpdates);
 }
 
 static void SaveSettings() {
@@ -375,6 +436,10 @@ static void SaveSettings() {
                  g_settings.showCallStateIcon);
     WriteIniBool(L"General", L"StartWithWindows",
                  g_settings.startWithWindows);
+    WriteIniBool(L"Updates", L"CheckAutomatically",
+                 g_settings.checkForUpdates);
+    WriteIniBool(L"Updates", L"IncludePrereleases",
+                 g_settings.includePrereleaseUpdates);
     auto saveApp = [&](PCWSTR section, bool warning, bool cue, bool toggle,
                        const std::wstring& mutedText,
                        const std::wstring& callText, int threshold, int delay) {
@@ -1769,13 +1834,352 @@ static DWORD WINAPI HeadsetThreadProc(void*) {
     return 0;
 }
 
+static UpdateStatus GetUpdateStatus() {
+    AcquireSRWLockShared(&g_updateStatusLock);
+    UpdateStatus result = g_updateStatus;
+    ReleaseSRWLockShared(&g_updateStatusLock);
+    return result;
+}
+
+static void SetUpdateStatus(UpdateCheckState state,
+                            std::wstring version = L"",
+                            std::wstring releaseUrl = L"") {
+    AcquireSRWLockExclusive(&g_updateStatusLock);
+    g_updateStatus.state = state;
+    g_updateStatus.version = std::move(version);
+    g_updateStatus.releaseUrl = std::move(releaseUrl);
+    ReleaseSRWLockExclusive(&g_updateStatusLock);
+}
+
+static ULONGLONG CurrentUnixSeconds() {
+    FILETIME fileTime{};
+    GetSystemTimeAsFileTime(&fileTime);
+    ULARGE_INTEGER value{};
+    value.LowPart = fileTime.dwLowDateTime;
+    value.HighPart = fileTime.dwHighDateTime;
+    constexpr ULONGLONG kWindowsToUnixEpoch = 116444736000000000ULL;
+    return value.QuadPart > kWindowsToUnixEpoch
+               ? (value.QuadPart - kWindowsToUnixEpoch) / 10000000ULL
+               : 0;
+}
+
+static std::wstring Utf8ToWide(const std::string& value) {
+    if (value.empty()) return L"";
+    int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                     value.data(),
+                                     static_cast<int>(value.size()), nullptr,
+                                     0);
+    if (length <= 0) return L"";
+    std::wstring result(static_cast<size_t>(length), L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+                        static_cast<int>(value.size()), result.data(), length);
+    return result;
+}
+
+struct ParsedVersion {
+    int parts[4]{};
+    bool valid = false;
+};
+
+static ParsedVersion ParseVersion(const std::string& tag) {
+    ParsedVersion result;
+    size_t position = !tag.empty() && (tag[0] == 'v' || tag[0] == 'V') ? 1 : 0;
+    int part = 0;
+    bool sawDigit = false;
+    while (position < tag.size() && part < 4) {
+        if (tag[position] < '0' || tag[position] > '9') return result;
+        int value = 0;
+        while (position < tag.size() && tag[position] >= '0' &&
+               tag[position] <= '9') {
+            if (value > 1000000) return result;
+            value = value * 10 + (tag[position++] - '0');
+            sawDigit = true;
+        }
+        result.parts[part++] = value;
+        if (position == tag.size() || tag[position] == '-' ||
+            tag[position] == '+')
+            break;
+        if (tag[position++] != '.') return result;
+    }
+    if (position < tag.size() && tag[position] != '-' && tag[position] != '+')
+        return result;
+    result.valid = sawDigit;
+    return result;
+}
+
+static int CompareVersions(const ParsedVersion& left,
+                           const ParsedVersion& right) {
+    for (size_t index = 0; index < ARRAYSIZE(left.parts); ++index) {
+        if (left.parts[index] != right.parts[index])
+            return left.parts[index] < right.parts[index] ? -1 : 1;
+    }
+    return 0;
+}
+
+static bool JsonBoolean(const std::string& object, const char* key,
+                        bool& value) {
+    std::string marker = std::string("\"") + key + "\"";
+    size_t position = object.find(marker);
+    if (position == std::string::npos) return false;
+    position = object.find(':', position + marker.size());
+    if (position == std::string::npos) return false;
+    position = object.find_first_not_of(" \t\r\n", position + 1);
+    if (position == std::string::npos) return false;
+    if (object.compare(position, 4, "true") == 0) {
+        value = true;
+        return true;
+    }
+    if (object.compare(position, 5, "false") == 0) {
+        value = false;
+        return true;
+    }
+    return false;
+}
+
+static bool JsonString(const std::string& object, const char* key,
+                       std::string& value) {
+    std::string marker = std::string("\"") + key + "\"";
+    size_t position = object.find(marker);
+    if (position == std::string::npos) return false;
+    position = object.find(':', position + marker.size());
+    if (position == std::string::npos) return false;
+    position = object.find_first_not_of(" \t\r\n", position + 1);
+    if (position == std::string::npos || object[position] != '"') return false;
+    ++position;
+    value.clear();
+    while (position < object.size()) {
+        char character = object[position++];
+        if (character == '"') return true;
+        if (character != '\\') {
+            value.push_back(character);
+            continue;
+        }
+        if (position >= object.size()) return false;
+        char escaped = object[position++];
+        switch (escaped) {
+            case '"':
+            case '\\':
+            case '/':
+                value.push_back(escaped);
+                break;
+            case 'b': value.push_back('\b'); break;
+            case 'f': value.push_back('\f'); break;
+            case 'n': value.push_back('\n'); break;
+            case 'r': value.push_back('\r'); break;
+            case 't': value.push_back('\t'); break;
+            default:
+                return false;
+        }
+    }
+    return false;
+}
+
+static std::vector<std::string> JsonTopLevelObjects(const std::string& json) {
+    std::vector<std::string> objects;
+    bool inString = false;
+    bool escaped = false;
+    int depth = 0;
+    size_t start = std::string::npos;
+    for (size_t index = 0; index < json.size(); ++index) {
+        char character = json[index];
+        if (inString) {
+            if (escaped) escaped = false;
+            else if (character == '\\') escaped = true;
+            else if (character == '"') inString = false;
+            continue;
+        }
+        if (character == '"') {
+            inString = true;
+        } else if (character == '{') {
+            if (depth++ == 0) start = index;
+        } else if (character == '}' && depth > 0) {
+            if (--depth == 0 && start != std::string::npos) {
+                objects.emplace_back(json.substr(start, index - start + 1));
+                start = std::string::npos;
+            }
+        }
+    }
+    return objects;
+}
+
+class WinHttpHandle {
+public:
+    WinHttpHandle() = default;
+    explicit WinHttpHandle(HINTERNET value) : value_(value) {}
+    ~WinHttpHandle() {
+        if (value_) WinHttpCloseHandle(value_);
+    }
+    WinHttpHandle(const WinHttpHandle&) = delete;
+    WinHttpHandle& operator=(const WinHttpHandle&) = delete;
+    HINTERNET get() const { return value_; }
+    explicit operator bool() const { return value_ != nullptr; }
+
+private:
+    HINTERNET value_ = nullptr;
+};
+
+static bool FetchReleaseJson(std::string& response) {
+    std::wstring userAgent = L"MuteAlert/" MUTEALERT_VERSION_WSTRING;
+    WinHttpHandle session(WinHttpOpen(
+        userAgent.c_str(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
+    if (!session) return false;
+    WinHttpSetTimeouts(session.get(), 5000, 5000, 5000, 5000);
+    WinHttpHandle connection(WinHttpConnect(session.get(), L"api.github.com",
+                                            INTERNET_DEFAULT_HTTPS_PORT, 0));
+    if (!connection) return false;
+    WinHttpHandle request(WinHttpOpenRequest(
+        connection.get(), L"GET", kReleasesApiPath, nullptr,
+        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+        WINHTTP_FLAG_SECURE));
+    if (!request) return false;
+    constexpr wchar_t headers[] =
+        L"Accept: application/vnd.github+json\r\n"
+        L"X-GitHub-Api-Version: 2026-03-10\r\n";
+    if (!WinHttpSendRequest(request.get(), headers, static_cast<DWORD>(-1),
+                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+        !WinHttpReceiveResponse(request.get(), nullptr))
+        return false;
+    DWORD status = 0;
+    DWORD statusSize = sizeof(status);
+    if (!WinHttpQueryHeaders(
+            request.get(), WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize,
+            WINHTTP_NO_HEADER_INDEX) ||
+        status != HTTP_STATUS_OK)
+        return false;
+    response.clear();
+    for (;;) {
+        DWORD available = 0;
+        if (!WinHttpQueryDataAvailable(request.get(), &available)) return false;
+        if (available == 0) break;
+        if (response.size() + available > 2 * 1024 * 1024) return false;
+        size_t oldSize = response.size();
+        response.resize(oldSize + available);
+        DWORD read = 0;
+        if (!WinHttpReadData(request.get(), response.data() + oldSize,
+                             available, &read))
+            return false;
+        response.resize(oldSize + read);
+    }
+    return !response.empty();
+}
+
+struct ReleaseInfo {
+    std::string tag;
+    std::string url;
+    ParsedVersion version;
+};
+
+static bool FindNewestRelease(const std::string& json, bool includePrereleases,
+                              ReleaseInfo& newest) {
+    bool found = false;
+    for (const std::string& object : JsonTopLevelObjects(json)) {
+        bool draft = false;
+        bool prerelease = false;
+        std::string tag;
+        std::string url;
+        if (!JsonBoolean(object, "draft", draft) || draft ||
+            !JsonBoolean(object, "prerelease", prerelease) ||
+            (prerelease && !includePrereleases) ||
+            !JsonString(object, "tag_name", tag) ||
+            !JsonString(object, "html_url", url))
+            continue;
+        ParsedVersion parsed = ParseVersion(tag);
+        if (!parsed.valid) continue;
+        if (!found || CompareVersions(parsed, newest.version) > 0) {
+            newest = {tag, url, parsed};
+            found = true;
+        }
+    }
+    return found;
+}
+
+static void PerformUpdateCheck(bool includePrereleases) {
+    SetUpdateStatus(UpdateCheckState::Checking);
+    PostMessageW(g_mainWindow, kUpdateCheckCompleted, 0, 0);
+    std::string json;
+    ReleaseInfo newest;
+    if (!FetchReleaseJson(json)) {
+        SetUpdateStatus(UpdateCheckState::Failed);
+        PostMessageW(g_mainWindow, kUpdateCheckCompleted, 0, 0);
+        return;
+    }
+    bool found = FindNewestRelease(json, includePrereleases, newest);
+    ULONGLONG now = CurrentUnixSeconds();
+    g_lastUpdateCheckTime.store(now);
+    WriteIniUInt64(L"Updates", L"LastSuccessfulCheck", now);
+    ParsedVersion current = ParseVersion(MUTEALERT_VERSION_STRING);
+    if (found && current.valid &&
+        CompareVersions(newest.version, current) > 0) {
+        std::wstring version = Utf8ToWide(newest.tag);
+        if (!version.empty() && (version[0] == L'v' || version[0] == L'V'))
+            version.erase(0, 1);
+        SetUpdateStatus(UpdateCheckState::Available, std::move(version),
+                        Utf8ToWide(newest.url));
+    } else {
+        SetUpdateStatus(UpdateCheckState::UpToDate);
+    }
+    PostMessageW(g_mainWindow, kUpdateCheckCompleted, 0, 0);
+}
+
+static DWORD WINAPI UpdateThreadProc(void*) {
+    if (WaitForSingleObject(g_stopEvent, 3000) != WAIT_TIMEOUT) return 0;
+    HANDLE events[] = {g_stopEvent, g_updateWakeEvent};
+    ULONGLONG lastAttempt = 0;
+    for (;;) {
+        bool manual = g_manualUpdateCheck.exchange(false);
+        ULONGLONG now = CurrentUnixSeconds();
+        ULONGLONG last = g_lastUpdateCheckTime.load();
+        bool due = g_checkForUpdates.load() &&
+                   (last == 0 || now < last ||
+                    now - last >= kUpdateCheckIntervalSeconds) &&
+                   (lastAttempt == 0 || now < lastAttempt ||
+                    now - lastAttempt >= kUpdateRetryIntervalSeconds);
+        if (manual || due) {
+            lastAttempt = now;
+            PerformUpdateCheck(manual
+                                   ? g_manualIncludePrereleaseUpdates.load()
+                                   : g_includePrereleaseUpdates.load());
+        }
+
+        DWORD waitMilliseconds = INFINITE;
+        if (g_checkForUpdates.load()) {
+            now = CurrentUnixSeconds();
+            last = g_lastUpdateCheckTime.load();
+            ULONGLONG remaining = 1;
+            if (last == 0 || now < last) {
+                remaining = lastAttempt != 0 && now >= lastAttempt
+                                ? kUpdateRetryIntervalSeconds - std::min(
+                                      now - lastAttempt,
+                                      kUpdateRetryIntervalSeconds - 1)
+                                : 1;
+            } else if (now - last < kUpdateCheckIntervalSeconds) {
+                remaining = kUpdateCheckIntervalSeconds - (now - last);
+            } else if (lastAttempt != 0 && now >= lastAttempt &&
+                       now - lastAttempt < kUpdateRetryIntervalSeconds) {
+                remaining = kUpdateRetryIntervalSeconds -
+                            (now - lastAttempt);
+            }
+            waitMilliseconds = static_cast<DWORD>(std::min<ULONGLONG>(
+                remaining * 1000ULL, MAXDWORD - 1ULL));
+        }
+        DWORD result = WaitForMultipleObjects(ARRAYSIZE(events), events,
+                                              FALSE, waitMilliseconds);
+        if (result == WAIT_OBJECT_0 || g_exiting.load()) break;
+    }
+    return 0;
+}
+
 static bool StartWorkers() {
     g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_wakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!g_stopEvent || !g_wakeEvent) {
+    g_updateWakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g_stopEvent || !g_wakeEvent || !g_updateWakeEvent) {
         if (g_stopEvent) CloseHandle(g_stopEvent);
         if (g_wakeEvent) CloseHandle(g_wakeEvent);
-        g_stopEvent = g_wakeEvent = nullptr;
+        if (g_updateWakeEvent) CloseHandle(g_updateWakeEvent);
+        g_stopEvent = g_wakeEvent = g_updateWakeEvent = nullptr;
         return false;
     }
     g_audioThread = CreateThread(nullptr, 0, AudioThreadProc, nullptr, 0,
@@ -1792,12 +2196,15 @@ static bool StartWorkers() {
     if (g_settings.headsetMode != L"off")
         g_headsetThread = CreateThread(nullptr, 0, HeadsetThreadProc, nullptr,
                                        0, nullptr);
+    g_updateThread = CreateThread(nullptr, 0, UpdateThreadProc, nullptr, 0,
+                                  nullptr);
     return g_audioThread != nullptr;
 }
 
 static void StopWorkers() {
     if (g_stopEvent) SetEvent(g_stopEvent);
-    HANDLE threads[] = {g_headsetThread, g_callThread, g_audioThread};
+    HANDLE threads[] = {g_updateThread, g_headsetThread, g_callThread,
+                        g_audioThread};
     for (HANDLE thread : threads) {
         if (thread) {
             WaitForSingleObject(thread, INFINITE);
@@ -1806,8 +2213,9 @@ static void StopWorkers() {
     }
     if (g_stopEvent) CloseHandle(g_stopEvent);
     if (g_wakeEvent) CloseHandle(g_wakeEvent);
-    g_headsetThread = g_callThread = g_audioThread = nullptr;
-    g_stopEvent = g_wakeEvent = nullptr;
+    if (g_updateWakeEvent) CloseHandle(g_updateWakeEvent);
+    g_updateThread = g_headsetThread = g_callThread = g_audioThread = nullptr;
+    g_stopEvent = g_wakeEvent = g_updateWakeEvent = nullptr;
 }
 
 static void AddRoundedRect(GraphicsPath& path, RectF rectangle, REAL radius) {
@@ -2092,6 +2500,7 @@ static void ShowWarningBalloon() {
         apps += L"Zoom";
     }
     if (apps.empty()) return;
+    g_updateBalloonActive.store(false);
     NOTIFYICONDATAW data = BaseNotifyData(kMicIconId, kMicIconGuid);
     data.uFlags = NIF_INFO | NIF_GUID;
     StringCchCopyW(data.szInfoTitle, ARRAYSIZE(data.szInfoTitle),
@@ -2102,6 +2511,19 @@ static void ShowWarningBalloon() {
                              : L" are muted.");
     StringCchCopyW(data.szInfo, ARRAYSIZE(data.szInfo), body.c_str());
     data.dwInfoFlags = NIIF_WARNING | NIIF_RESPECT_QUIET_TIME;
+    Shell_NotifyIconW(NIM_MODIFY, &data);
+}
+
+static void ShowUpdateBalloon(const std::wstring& version) {
+    NOTIFYICONDATAW data = BaseNotifyData(kMicIconId, kMicIconGuid);
+    data.uFlags = NIF_INFO | NIF_GUID;
+    StringCchCopyW(data.szInfoTitle, ARRAYSIZE(data.szInfoTitle),
+                   L"MuteAlert update available");
+    std::wstring body = L"Version " + version +
+                        L" is available. Click to view the GitHub release.";
+    StringCchCopyW(data.szInfo, ARRAYSIZE(data.szInfo), body.c_str());
+    data.dwInfoFlags = NIIF_INFO | NIIF_RESPECT_QUIET_TIME;
+    g_updateBalloonActive.store(true);
     Shell_NotifyIconW(NIM_MODIFY, &data);
 }
 
@@ -2310,8 +2732,14 @@ enum ControlId {
     IDC_HEADSET_METHOD,
     IDC_HEADSET_CONFIDENCE,
     IDC_HEADSET_EXPORT,
+    IDC_UPDATES_AUTOMATIC = 700,
+    IDC_UPDATES_PRERELEASE,
+    IDC_UPDATES_CHECK_NOW,
+    IDC_UPDATES_STATUS,
+    IDC_UPDATES_VIEW_RELEASE,
     IDM_SETTINGS = 800,
     IDM_TOGGLE_CALLS,
+    IDM_VIEW_UPDATE,
     IDM_EXIT
 };
 
@@ -2447,6 +2875,32 @@ static void CreateHeadsetPage(HWND window) {
             32, 358, 510, 62, page);
 }
 
+static void CreateUpdatesPage(HWND window) {
+    int page = 5;
+    AddLabel(window, L"MuteAlert updates", 32, 58, 400, page);
+    std::wstring current = L"Current version: ";
+    current += MUTEALERT_VERSION_WSTRING;
+    AddLabel(window, current.c_str(), 32, 88, 400, page);
+    AddCheck(window, L"Check GitHub for updates automatically",
+             IDC_UPDATES_AUTOMATIC, 32, 126, 400, page);
+    AddCheck(window, L"Include pre-release versions",
+             IDC_UPDATES_PRERELEASE, 32, 160, 400, page);
+    AddControl(window, L"BUTTON", L"Check now", WS_TABSTOP, 32, 208, 120,
+               30, IDC_UPDATES_CHECK_NOW, page);
+    AddControl(window, L"STATIC", L"Not checked yet.", SS_LEFT, 32, 258,
+               500, 44, IDC_UPDATES_STATUS, page);
+    HWND viewRelease = AddControl(window, L"BUTTON", L"View release",
+                                  WS_TABSTOP, 32, 310, 140, 30,
+                                  IDC_UPDATES_VIEW_RELEASE, page);
+    EnableWindow(viewRelease, FALSE);
+    AddNote(window,
+            L"Update checks make an anonymous request to MuteAlert's public "
+            L"GitHub releases. No GitHub account or token is used. MuteAlert "
+            L"only notifies you and never downloads or installs updates "
+            L"automatically.",
+            32, 366, 510, 72, page);
+}
+
 static void ShowSettingsPage(int page) {
     for (auto [control, controlPage] : g_pageControls)
         ShowWindow(control, controlPage == page ? SW_SHOW : SW_HIDE);
@@ -2469,6 +2923,45 @@ static void UpdateHeadsetStatusControls(HWND window) {
                     HeadsetConfidenceName(status.confidence));
 }
 
+static void UpdateUpdateStatusControls(HWND window) {
+    if (!window || !IsWindow(window)) return;
+    UpdateStatus status = GetUpdateStatus();
+    std::wstring text;
+    switch (status.state) {
+        case UpdateCheckState::Checking:
+            text = L"Checking GitHub for updates…";
+            break;
+        case UpdateCheckState::UpToDate:
+            text = L"MuteAlert is up to date.";
+            break;
+        case UpdateCheckState::Available:
+            text = L"MuteAlert " + status.version + L" is available.";
+            break;
+        case UpdateCheckState::Failed:
+            text = L"Couldn't check for updates. Check your internet "
+                   L"connection and try again.";
+            break;
+        case UpdateCheckState::NotChecked:
+        default:
+            text = L"Not checked yet.";
+            break;
+    }
+    SetDlgItemTextW(window, IDC_UPDATES_STATUS, text.c_str());
+    EnableWindow(GetDlgItem(window, IDC_UPDATES_CHECK_NOW),
+                 status.state != UpdateCheckState::Checking);
+    EnableWindow(GetDlgItem(window, IDC_UPDATES_VIEW_RELEASE),
+                 status.state == UpdateCheckState::Available &&
+                     !status.releaseUrl.empty());
+}
+
+static void OpenAvailableRelease() {
+    UpdateStatus status = GetUpdateStatus();
+    if (status.state == UpdateCheckState::Available &&
+        !status.releaseUrl.empty())
+        ShellExecuteW(nullptr, L"open", status.releaseUrl.c_str(), nullptr,
+                      nullptr, SW_SHOWNORMAL);
+}
+
 static void LoadSettingsControls(HWND window, const Settings& settings) {
     int role = settings.deviceRole == eCommunications
                    ? 1
@@ -2482,6 +2975,9 @@ static void LoadSettingsControls(HWND window, const Settings& settings) {
     SetEdit(window, IDC_SENSITIVITY, settings.peakSensitivity);
     SetCheck(window, IDC_SHOW_CALL_ICON, settings.showCallStateIcon);
     SetCheck(window, IDC_STARTUP, settings.startWithWindows);
+    SetCheck(window, IDC_UPDATES_AUTOMATIC, settings.checkForUpdates);
+    SetCheck(window, IDC_UPDATES_PRERELEASE,
+             settings.includePrereleaseUpdates);
     auto setApp = [&](int base, bool warning, bool cue, bool toggle,
                       const std::wstring& muted, const std::wstring& marker,
                       int threshold, int delay) {
@@ -2514,6 +3010,7 @@ static void LoadSettingsControls(HWND window, const Settings& settings) {
     SetCheck(window, IDC_HEADSET_CALLS, settings.headsetSyncCalls);
     SetEdit(window, IDC_HEADSET_INTERVAL, settings.headsetPollInterval);
     UpdateHeadsetStatusControls(window);
+    UpdateUpdateStatusControls(window);
 }
 
 static std::wstring GetEditText(HWND window, int id, PCWSTR fallback) {
@@ -2549,6 +3046,10 @@ static Settings ReadSettingsControls(HWND window) {
         IsDlgButtonChecked(window, IDC_SHOW_CALL_ICON) == BST_CHECKED;
     settings.startWithWindows =
         IsDlgButtonChecked(window, IDC_STARTUP) == BST_CHECKED;
+    settings.checkForUpdates =
+        IsDlgButtonChecked(window, IDC_UPDATES_AUTOMATIC) == BST_CHECKED;
+    settings.includePrereleaseUpdates =
+        IsDlgButtonChecked(window, IDC_UPDATES_PRERELEASE) == BST_CHECKED;
     auto readApp = [&](int base, bool& warning, bool& cue, bool& toggle,
                        std::wstring& muted, std::wstring& marker,
                        int& threshold, int& delay, PCWSTR defaultMuted,
@@ -2597,7 +3098,7 @@ static LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message,
             HWND tab = AddControl(window, WC_TABCONTROLW, L"",
                                   WS_TABSTOP, 12, 12, 576, 450, IDC_TAB, -1);
             for (PCWSTR name : {L"General", L"Slack", L"Teams", L"Zoom",
-                                L"Headset"}) {
+                                L"Headset", L"Updates"}) {
                 TCITEMW item{};
                 item.mask = TCIF_TEXT;
                 item.pszText = const_cast<PWSTR>(name);
@@ -2610,6 +3111,7 @@ static LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message,
             CreateCallPage(window, 3, L"Zoom", IDC_ZOOM_WARNING,
                            L"leave|end");
             CreateHeadsetPage(window);
+            CreateUpdatesPage(window);
             AddControl(window, L"BUTTON", L"Restore defaults", WS_TABSTOP,
                        12, 474, 130, 30, IDC_DEFAULTS, -1);
             AddControl(window, L"BUTTON", L"Save", BS_DEFPUSHBUTTON | WS_TABSTOP,
@@ -2639,6 +3141,9 @@ static LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message,
                     g_peakSensitivity.store(g_settings.peakSensitivity);
                     g_forceVolume.store(g_settings.forceVolume);
                     g_forcedVolume.store(g_settings.forcedVolume);
+                    g_checkForUpdates.store(g_settings.checkForUpdates);
+                    g_includePrereleaseUpdates.store(
+                        g_settings.includePrereleaseUpdates);
                     g_pendingVolumeNotches.store(0);
                     g_pendingVolumeSet.store(
                         g_settings.forceVolume ? g_settings.forcedVolume : -1);
@@ -2654,6 +3159,18 @@ static LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message,
                     return 0;
                 case IDC_HEADSET_EXPORT:
                     ExportHeadsetDiagnostics(window);
+                    return 0;
+                case IDC_UPDATES_CHECK_NOW:
+                    g_manualIncludePrereleaseUpdates.store(
+                        IsDlgButtonChecked(window, IDC_UPDATES_PRERELEASE) ==
+                        BST_CHECKED);
+                    SetUpdateStatus(UpdateCheckState::Checking);
+                    UpdateUpdateStatusControls(window);
+                    g_manualUpdateCheck.store(true);
+                    if (g_updateWakeEvent) SetEvent(g_updateWakeEvent);
+                    return 0;
+                case IDC_UPDATES_VIEW_RELEASE:
+                    OpenAvailableRelease();
                     return 0;
                 case IDC_CANCEL:
                     DestroyWindow(window);
@@ -2690,6 +3207,13 @@ static void ShowSettings() {
 
 static void ShowTrayMenu(POINT point) {
     HMENU menu = CreatePopupMenu();
+    UpdateStatus update = GetUpdateStatus();
+    if (update.state == UpdateCheckState::Available) {
+        std::wstring label = L"View MuteAlert " + update.version +
+                             L" update…";
+        AppendMenuW(menu, MF_STRING, IDM_VIEW_UPDATE, label.c_str());
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    }
     if (!CallList(false).empty()) {
         AppendMenuW(menu, MF_STRING, IDM_TOGGLE_CALLS,
                     L"Mute/unmute active call(s)");
@@ -2785,7 +3309,13 @@ static void HandleTrayEvent(WPARAM wParam, LPARAM lParam) {
         ShowTrayMenu(point);
         return;
     }
-    if (event == NIN_BALLOONUSERCLICK) ShowSettings();
+    if (event == NIN_BALLOONUSERCLICK) {
+        if (g_updateBalloonActive.exchange(false)) OpenAvailableRelease();
+        else ShowSettings();
+        return;
+    }
+    if (event == NIN_BALLOONHIDE || event == NIN_BALLOONTIMEOUT)
+        g_updateBalloonActive.store(false);
 }
 
 static LRESULT CALLBACK MouseHookProc(int code, WPARAM wParam,
@@ -2830,6 +3360,19 @@ static LRESULT CALLBACK MainWindowProc(HWND window, UINT message,
             g_previousWarning = warning;
             return 0;
         }
+        case kUpdateCheckCompleted: {
+            UpdateUpdateStatusControls(g_settingsWindow);
+            UpdateStatus status = GetUpdateStatus();
+            if (status.state == UpdateCheckState::Available &&
+                !status.version.empty() &&
+                status.version != g_lastNotifiedVersion) {
+                g_lastNotifiedVersion = status.version;
+                WriteIniString(L"Updates", L"LastNotifiedVersion",
+                               g_lastNotifiedVersion);
+                ShowUpdateBalloon(status.version);
+            }
+            return 0;
+        }
         case WM_INPUT:
             ProcessStandardHidRawInput(
                 reinterpret_cast<HRAWINPUT>(lParam));
@@ -2858,6 +3401,9 @@ static LRESULT CALLBACK MainWindowProc(HWND window, UINT message,
                     return 0;
                 case IDM_TOGGLE_CALLS:
                     QueueCallToggles();
+                    return 0;
+                case IDM_VIEW_UPDATE:
+                    OpenAvailableRelease();
                     return 0;
                 case IDM_EXIT:
                     DestroyWindow(window);

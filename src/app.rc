@@ -1,6 +1,7 @@
 #define RT_MANIFEST 24
 
 #include <winver.h>
+#include "version.h"
 
 #define IDI_APP_ICON 101
 
@@ -8,8 +9,8 @@ IDI_APP_ICON ICON "../assets/app-icon.ico"
 1 RT_MANIFEST "app.manifest"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,9,1,0
- PRODUCTVERSION 0,9,1,0
+ FILEVERSION MUTEALERT_VERSION_MAJOR,MUTEALERT_VERSION_MINOR,MUTEALERT_VERSION_PATCH,MUTEALERT_VERSION_BUILD
+ PRODUCTVERSION MUTEALERT_VERSION_MAJOR,MUTEALERT_VERSION_MINOR,MUTEALERT_VERSION_PATCH,MUTEALERT_VERSION_BUILD
  FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
  FILEFLAGS VS_FF_DEBUG
@@ -26,12 +27,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "MuteAlert"
             VALUE "FileDescription", "MuteAlert"
-            VALUE "FileVersion", "0.9.1.0"
+            VALUE "FileVersion", MUTEALERT_FILE_VERSION_STRING
             VALUE "InternalName", "MuteAlert.exe"
             VALUE "LegalCopyright", "Copyright 2026 Nikolay Dimitrov"
             VALUE "OriginalFilename", "MuteAlert.exe"
             VALUE "ProductName", "MuteAlert"
-            VALUE "ProductVersion", "0.9.1"
+            VALUE "ProductVersion", MUTEALERT_VERSION_STRING
         END
     END
     BLOCK "VarFileInfo"

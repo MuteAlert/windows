@@ -5,6 +5,8 @@ project(MuteAlert LANGUAGES CXX RC)
 add_executable(MuteAlert WIN32
     src/main.cpp
     src/headset_adapters.cpp
+    src/headset_adapters.h
+    src/version.h
     src/app.rc
 )
 
@@ -47,6 +49,7 @@ target_link_libraries(MuteAlert PRIVATE
     shlwapi
     user32
     uuid
+    winhttp
 )
 
 install(TARGETS MuteAlert RUNTIME DESTINATION .)
