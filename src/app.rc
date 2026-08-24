@@ -1,0 +1,6 @@
+#define RT_MANIFEST 24
+
+#define IDI_APP_ICON 101
+
+IDI_APP_ICON ICON "../assets/app-icon.ico"
+1 RT_MANIFEST "app.manifest"

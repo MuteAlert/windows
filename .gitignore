@@ -1,0 +1,6 @@
+/build/
+/build-*/
+/bin/*-previous.exe
+/bin/*-broken.exe
+/bin/*-backup.exe
+
