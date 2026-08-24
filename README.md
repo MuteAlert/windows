@@ -1,4 +1,4 @@
-# Microphone Activity Widget — standalone
+# MuteAlert for Windows
 
 A native Windows 11 notification-area application containing the complete
 microphone widget without Windhawk or Explorer injection.
@@ -28,8 +28,7 @@ microphone widget without Windhawk or Explorer injection.
 - Tabbed settings panel with General, Slack, Teams, Zoom, and Headset pages.
 - Embedded multi-resolution microphone application icon for Explorer,
   shortcuts, the taskbar, and Settings windows.
-- Settings stored at
-  `%LOCALAPPDATA%\MicrophoneActivityWidget\settings.ini`.
+- Settings stored at `%LOCALAPPDATA%\MuteAlert\settings.ini`.
 - Optional per-user automatic startup.
 
 Middle-click either icon to open Settings. When a call is active, right-click
@@ -46,7 +45,7 @@ call icons to the visible taskbar area.
 1. Install Visual Studio 2022 with **Desktop development with C++**.
 2. Open this `standalone` folder in Visual Studio.
 3. Select an x64 configuration.
-4. Build `MicrophoneActivityWidget`.
+4. Build `MuteAlert`.
 
 Or from a Visual Studio developer terminal:
 
@@ -55,7 +54,7 @@ cmake -S . -B build -A x64
 cmake --build build --config Release
 ```
 
-The executable is produced under `build\Release`. It does not require
+The executable is produced as `build\Release\MuteAlert.exe`. It does not require
 administrator rights. The Release build statically embeds its C++ runtime, so
 no compiler-specific DLL or `.whl` files need to be distributed beside it.
 Keep the executable at a stable path if you enable automatic startup or

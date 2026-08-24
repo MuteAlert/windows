@@ -109,9 +109,8 @@ private:
     T* value_ = nullptr;
 };
 
-static constexpr wchar_t kAppName[] = L"Microphone Activity Widget";
-static constexpr wchar_t kWindowClass[] =
-    L"MicrophoneActivityWidget.Standalone.Window";
+static constexpr wchar_t kAppName[] = L"MuteAlert";
+static constexpr wchar_t kWindowClass[] = L"MuteAlert.Standalone.Window";
 static constexpr UINT kTrayCallback = WM_APP + 1;
 static constexpr UINT kStateChanged = WM_APP + 2;
 static constexpr UINT kWheelMessage = WM_APP + 3;
@@ -133,7 +132,7 @@ static void Log(PCWSTR format, ...) {
     va_start(args, format);
     StringCchVPrintfW(message, ARRAYSIZE(message), format, args);
     va_end(args);
-    OutputDebugStringW(L"[Microphone Activity Widget] ");
+    OutputDebugStringW(L"[MuteAlert] ");
     OutputDebugStringW(message);
     OutputDebugStringW(L"\n");
 }
@@ -2110,7 +2109,7 @@ static std::wstring BuildHeadsetDiagnostics() {
     SYSTEMTIME now{};
     GetLocalTime(&now);
     std::wstringstream output;
-    output << L"Microphone Activity Widget — headset diagnostics\r\n";
+    output << L"MuteAlert — headset diagnostics\r\n";
     output << L"Generated: " << now.wYear << L"-";
     output.width(2);
     output.fill(L'0');
@@ -2248,7 +2247,7 @@ static bool WriteUtf8File(const std::wstring& path,
 
 static void ExportHeadsetDiagnostics(HWND owner) {
     wchar_t path[MAX_PATH] =
-        L"MicrophoneActivityWidget-headset-diagnostics.txt";
+        L"MuteAlert-headset-diagnostics.txt";
     OPENFILENAMEW dialog{};
     dialog.lStructSize = sizeof(dialog);
     dialog.hwndOwner = owner;
@@ -2680,8 +2679,8 @@ static void ShowSettings() {
     }
     g_settingsWindow = CreateWindowExW(
         WS_EX_APPWINDOW | WS_EX_CONTROLPARENT,
-        L"MicrophoneActivityWidget.Settings",
-        L"Settings — Microphone Activity Widget",
+        L"MuteAlert.Settings",
+        L"Settings — MuteAlert",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT, 616, 550, nullptr, nullptr, g_instance,
         nullptr);
@@ -2882,8 +2881,7 @@ static bool InitializeSettingsPath() {
     if (FAILED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA | CSIDL_FLAG_CREATE,
                                 nullptr, SHGFP_TYPE_CURRENT, localAppData)))
         return false;
-    std::wstring directory = std::wstring(localAppData) +
-                             L"\\MicrophoneActivityWidget";
+    std::wstring directory = std::wstring(localAppData) + L"\\MuteAlert";
     if (!CreateDirectoryW(directory.c_str(), nullptr) &&
         GetLastError() != ERROR_ALREADY_EXISTS)
         return false;
@@ -2895,7 +2893,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     g_instance = instance;
     g_diagnosticStartTime = GetTickCount64();
     g_singleInstance = CreateMutexW(
-        nullptr, FALSE, L"Local\\MicrophoneActivityWidget.Standalone.Instance");
+        nullptr, FALSE, L"Local\\MuteAlert.Standalone.Instance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         if (HWND existing = FindWindowW(kWindowClass, nullptr))
             PostMessageW(existing, kShowSettingsMessage, 0, 0);
@@ -2937,7 +2935,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     settingsClass.cbSize = sizeof(settingsClass);
     settingsClass.lpfnWndProc = SettingsWindowProc;
     settingsClass.hInstance = instance;
-    settingsClass.lpszClassName = L"MicrophoneActivityWidget.Settings";
+    settingsClass.lpszClassName = L"MuteAlert.Settings";
     settingsClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     settingsClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
     settingsClass.hIcon = g_appIconLarge;
