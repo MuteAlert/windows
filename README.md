@@ -78,3 +78,14 @@ mute.
 
 See [HEADSET_ADAPTERS.md](HEADSET_ADAPTERS.md) for the provider architecture,
 privacy rules for diagnostics, and instructions for adding vendor protocols.
+
+## License
+
+The GitHub source and free GitHub build are source-available under the
+[PolyForm Shield License 1.0.0](LICENSE.md), with the declarations in
+[NOTICE](NOTICE). You may use, inspect, modify, and redistribute this edition,
+but you may not use it to provide a product that competes with MuteAlert.
+
+Official Microsoft Store and other commercial distributions may be offered
+under separate commercial terms. PolyForm Shield is a source-available license,
+not an OSI-approved open-source license.
