@@ -15,6 +15,7 @@
 #endif
 
 #include <windows.h>
+#include <bcrypt.h>
 #include <windowsx.h>
 #include <commctrl.h>
 #include <endpointvolume.h>
@@ -28,6 +29,7 @@
 #include <setupapi.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <shlwapi.h>
 #include <strsafe.h>
 #include <tlhelp32.h>
 #include <UIAutomation.h>
@@ -156,6 +158,7 @@ struct Settings {
     bool startWithWindows = false;
     bool checkForUpdates = true;
     bool includePrereleaseUpdates = true;
+    bool installUpdatesAutomatically = false;
 
     std::wstring headsetMode = L"full";
     bool headsetSyncWindows = true;
@@ -228,6 +231,8 @@ static std::atomic<bool> g_checkForUpdates{true};
 static std::atomic<bool> g_includePrereleaseUpdates{true};
 static std::atomic<bool> g_manualUpdateCheck{false};
 static std::atomic<bool> g_manualIncludePrereleaseUpdates{true};
+static std::atomic<bool> g_installUpdatesAutomatically{false};
+static std::atomic<bool> g_installUpdateRequested{false};
 static std::atomic<bool> g_slackActive{false};
 static std::atomic<bool> g_slackMuted{false};
 static std::atomic<bool> g_slackWarning{false};
@@ -249,6 +254,9 @@ enum class UpdateCheckState {
     Checking,
     UpToDate,
     Available,
+    Downloading,
+    ReadyToInstall,
+    InstallFailed,
     Failed,
 };
 
@@ -256,6 +264,9 @@ struct UpdateStatus {
     UpdateCheckState state = UpdateCheckState::NotChecked;
     std::wstring version;
     std::wstring releaseUrl;
+    std::wstring assetUrl;
+    std::wstring assetDigest;
+    std::wstring downloadedPath;
 };
 
 static SRWLOCK g_updateStatusLock = SRWLOCK_INIT;
@@ -370,6 +381,9 @@ static void LoadSettings() {
     g_settings.includePrereleaseUpdates = ReadIniBool(
         L"Updates", L"IncludePrereleases",
         defaults.includePrereleaseUpdates);
+    g_settings.installUpdatesAutomatically = ReadIniBool(
+        L"Updates", L"InstallAutomatically",
+        defaults.installUpdatesAutomatically);
     g_lastNotifiedVersion =
         ReadIniString(L"Updates", L"LastNotifiedVersion", L"");
     g_lastUpdateCheckTime.store(
@@ -419,6 +433,8 @@ static void LoadSettings() {
     g_checkForUpdates.store(g_settings.checkForUpdates);
     g_includePrereleaseUpdates.store(
         g_settings.includePrereleaseUpdates);
+    g_installUpdatesAutomatically.store(
+        g_settings.installUpdatesAutomatically);
 }
 
 static void SaveSettings() {
@@ -440,6 +456,8 @@ static void SaveSettings() {
                  g_settings.checkForUpdates);
     WriteIniBool(L"Updates", L"IncludePrereleases",
                  g_settings.includePrereleaseUpdates);
+    WriteIniBool(L"Updates", L"InstallAutomatically",
+                 g_settings.installUpdatesAutomatically);
     auto saveApp = [&](PCWSTR section, bool warning, bool cue, bool toggle,
                        const std::wstring& mutedText,
                        const std::wstring& callText, int threshold, int delay) {
@@ -1841,14 +1859,21 @@ static UpdateStatus GetUpdateStatus() {
     return result;
 }
 
+static void SetUpdateStatus(UpdateStatus status) {
+    AcquireSRWLockExclusive(&g_updateStatusLock);
+    g_updateStatus = std::move(status);
+    ReleaseSRWLockExclusive(&g_updateStatusLock);
+}
+
 static void SetUpdateStatus(UpdateCheckState state,
                             std::wstring version = L"",
-                            std::wstring releaseUrl = L"") {
-    AcquireSRWLockExclusive(&g_updateStatusLock);
-    g_updateStatus.state = state;
-    g_updateStatus.version = std::move(version);
-    g_updateStatus.releaseUrl = std::move(releaseUrl);
-    ReleaseSRWLockExclusive(&g_updateStatusLock);
+                            std::wstring releaseUrl = L"",
+                            std::wstring assetUrl = L"",
+                            std::wstring assetDigest = L"",
+                            std::wstring downloadedPath = L"") {
+    SetUpdateStatus({state, std::move(version), std::move(releaseUrl),
+                     std::move(assetUrl), std::move(assetDigest),
+                     std::move(downloadedPath)});
 }
 
 static ULONGLONG CurrentUnixSeconds() {
@@ -2002,6 +2027,35 @@ static std::vector<std::string> JsonTopLevelObjects(const std::string& json) {
     return objects;
 }
 
+static std::vector<std::string> JsonArrayObjects(const std::string& object,
+                                                 const char* key) {
+    std::string marker = std::string("\"") + key + "\"";
+    size_t position = object.find(marker);
+    if (position == std::string::npos) return {};
+    position = object.find(':', position + marker.size());
+    if (position == std::string::npos) return {};
+    position = object.find('[', position + 1);
+    if (position == std::string::npos) return {};
+    bool inString = false;
+    bool escaped = false;
+    int depth = 0;
+    for (size_t index = position; index < object.size(); ++index) {
+        char character = object[index];
+        if (inString) {
+            if (escaped) escaped = false;
+            else if (character == '\\') escaped = true;
+            else if (character == '"') inString = false;
+            continue;
+        }
+        if (character == '"') inString = true;
+        else if (character == '[') ++depth;
+        else if (character == ']' && --depth == 0)
+            return JsonTopLevelObjects(
+                object.substr(position + 1, index - position - 1));
+    }
+    return {};
+}
+
 class WinHttpHandle {
 public:
     WinHttpHandle() = default;
@@ -2068,6 +2122,8 @@ static bool FetchReleaseJson(std::string& response) {
 struct ReleaseInfo {
     std::string tag;
     std::string url;
+    std::string assetUrl;
+    std::string assetDigest;
     ParsedVersion version;
 };
 
@@ -2088,11 +2144,232 @@ static bool FindNewestRelease(const std::string& json, bool includePrereleases,
         ParsedVersion parsed = ParseVersion(tag);
         if (!parsed.valid) continue;
         if (!found || CompareVersions(parsed, newest.version) > 0) {
-            newest = {tag, url, parsed};
+            std::string assetUrl;
+            std::string assetDigest;
+            for (const std::string& asset :
+                 JsonArrayObjects(object, "assets")) {
+                std::string name;
+                std::string candidateUrl;
+                std::string candidateDigest;
+                if (JsonString(asset, "name", name) &&
+                    name == "MuteAlert.exe" &&
+                    JsonString(asset, "browser_download_url", candidateUrl) &&
+                    JsonString(asset, "digest", candidateDigest)) {
+                    assetUrl = std::move(candidateUrl);
+                    assetDigest = std::move(candidateDigest);
+                    break;
+                }
+            }
+            newest = {tag, url, std::move(assetUrl),
+                      std::move(assetDigest), parsed};
             found = true;
         }
     }
     return found;
+}
+
+static bool IsTrustedReleaseAssetUrl(const std::wstring& url) {
+    constexpr wchar_t prefix[] =
+        L"https://github.com/MuteAlert/windows/releases/download/";
+    return url.size() > ARRAYSIZE(prefix) - 1 &&
+           _wcsnicmp(url.c_str(), prefix, ARRAYSIZE(prefix) - 1) == 0;
+}
+
+static bool FetchUrlToFile(const std::wstring& url,
+                           const std::wstring& destination) {
+    if (!IsTrustedReleaseAssetUrl(url)) return false;
+    URL_COMPONENTSW components{};
+    components.dwStructSize = sizeof(components);
+    components.dwHostNameLength = static_cast<DWORD>(-1);
+    components.dwUrlPathLength = static_cast<DWORD>(-1);
+    components.dwExtraInfoLength = static_cast<DWORD>(-1);
+    if (!WinHttpCrackUrl(url.c_str(), static_cast<DWORD>(url.size()), 0,
+                         &components) ||
+        components.nScheme != INTERNET_SCHEME_HTTPS)
+        return false;
+    std::wstring host(components.lpszHostName, components.dwHostNameLength);
+    std::wstring path(components.lpszUrlPath, components.dwUrlPathLength);
+    if (components.lpszExtraInfo && components.dwExtraInfoLength)
+        path.append(components.lpszExtraInfo, components.dwExtraInfoLength);
+
+    std::wstring userAgent = L"MuteAlert/" MUTEALERT_VERSION_WSTRING;
+    WinHttpHandle session(WinHttpOpen(
+        userAgent.c_str(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
+    if (!session) return false;
+    WinHttpSetTimeouts(session.get(), 5000, 5000, 5000, 10000);
+    WinHttpHandle connection(
+        WinHttpConnect(session.get(), host.c_str(), components.nPort, 0));
+    if (!connection) return false;
+    WinHttpHandle request(WinHttpOpenRequest(
+        connection.get(), L"GET", path.c_str(), nullptr, WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE));
+    if (!request) return false;
+    DWORD redirectPolicy =
+        WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
+    WinHttpSetOption(request.get(), WINHTTP_OPTION_REDIRECT_POLICY,
+                     &redirectPolicy, sizeof(redirectPolicy));
+    constexpr wchar_t headers[] = L"Accept: application/octet-stream\r\n";
+    if (!WinHttpSendRequest(request.get(), headers, static_cast<DWORD>(-1),
+                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+        !WinHttpReceiveResponse(request.get(), nullptr))
+        return false;
+    DWORD status = 0;
+    DWORD statusSize = sizeof(status);
+    if (!WinHttpQueryHeaders(
+            request.get(), WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize,
+            WINHTTP_NO_HEADER_INDEX) ||
+        status != HTTP_STATUS_OK)
+        return false;
+
+    HANDLE file = CreateFileW(destination.c_str(), GENERIC_WRITE, 0, nullptr,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    bool succeeded = true;
+    ULONGLONG total = 0;
+    constexpr ULONGLONG kMaximumUpdateSize = 32ULL * 1024 * 1024;
+    for (;;) {
+        DWORD available = 0;
+        if (!WinHttpQueryDataAvailable(request.get(), &available)) {
+            succeeded = false;
+            break;
+        }
+        if (available == 0) break;
+        total += available;
+        if (total > kMaximumUpdateSize) {
+            succeeded = false;
+            break;
+        }
+        std::vector<unsigned char> buffer(available);
+        DWORD read = 0;
+        if (!WinHttpReadData(request.get(), buffer.data(), available, &read)) {
+            succeeded = false;
+            break;
+        }
+        DWORD written = 0;
+        if (!WriteFile(file, buffer.data(), read, &written, nullptr) ||
+            written != read) {
+            succeeded = false;
+            break;
+        }
+    }
+    if (total == 0) succeeded = false;
+    FlushFileBuffers(file);
+    CloseHandle(file);
+    if (!succeeded) DeleteFileW(destination.c_str());
+    return succeeded;
+}
+
+static std::wstring BytesToHex(const unsigned char* bytes, size_t length) {
+    constexpr wchar_t digits[] = L"0123456789abcdef";
+    std::wstring result(length * 2, L'0');
+    for (size_t index = 0; index < length; ++index) {
+        result[index * 2] = digits[bytes[index] >> 4];
+        result[index * 2 + 1] = digits[bytes[index] & 0x0f];
+    }
+    return result;
+}
+
+static bool Sha256File(const std::wstring& path, std::wstring& digest) {
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    bool succeeded = false;
+    DWORD objectLength = 0;
+    DWORD hashLength = 0;
+    DWORD resultLength = 0;
+    std::vector<unsigned char> object;
+    std::vector<unsigned char> result;
+    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(
+            &algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0)) ||
+        !BCRYPT_SUCCESS(BCryptGetProperty(
+            algorithm, BCRYPT_OBJECT_LENGTH,
+            reinterpret_cast<PUCHAR>(&objectLength), sizeof(objectLength),
+            &resultLength, 0)) ||
+        !BCRYPT_SUCCESS(BCryptGetProperty(
+            algorithm, BCRYPT_HASH_LENGTH,
+            reinterpret_cast<PUCHAR>(&hashLength), sizeof(hashLength),
+            &resultLength, 0)))
+        goto cleanup;
+    object.resize(objectLength);
+    result.resize(hashLength);
+    if (!BCRYPT_SUCCESS(BCryptCreateHash(
+            algorithm, &hash, object.data(), objectLength, nullptr, 0, 0)))
+        goto cleanup;
+    file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                       OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (file == INVALID_HANDLE_VALUE) goto cleanup;
+    for (;;) {
+        unsigned char buffer[64 * 1024];
+        DWORD read = 0;
+        if (!ReadFile(file, buffer, sizeof(buffer), &read, nullptr))
+            goto cleanup;
+        if (read == 0) break;
+        if (!BCRYPT_SUCCESS(BCryptHashData(hash, buffer, read, 0)))
+            goto cleanup;
+    }
+    if (!BCRYPT_SUCCESS(
+            BCryptFinishHash(hash, result.data(), hashLength, 0)))
+        goto cleanup;
+    digest = BytesToHex(result.data(), result.size());
+    succeeded = true;
+
+cleanup:
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    if (hash) BCryptDestroyHash(hash);
+    if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
+    return succeeded;
+}
+
+static bool DownloadUpdate(UpdateStatus status) {
+    if (status.state != UpdateCheckState::Available ||
+        status.assetUrl.empty() || status.assetDigest.empty() ||
+        !IsTrustedReleaseAssetUrl(status.assetUrl))
+        return false;
+    constexpr wchar_t digestPrefix[] = L"sha256:";
+    if (status.assetDigest.size() != 71 ||
+        _wcsnicmp(status.assetDigest.c_str(), digestPrefix,
+                  ARRAYSIZE(digestPrefix) - 1) != 0)
+        return false;
+    for (wchar_t character : status.version) {
+        if (!iswalnum(character) && character != L'.' && character != L'-' &&
+            character != L'_')
+            return false;
+    }
+    size_t slash = g_settingsPath.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) return false;
+    std::wstring updatesDirectory =
+        g_settingsPath.substr(0, slash) + L"\\Updates";
+    if (!CreateDirectoryW(updatesDirectory.c_str(), nullptr) &&
+        GetLastError() != ERROR_ALREADY_EXISTS)
+        return false;
+    std::wstring versionDirectory = updatesDirectory + L"\\" + status.version;
+    if (!CreateDirectoryW(versionDirectory.c_str(), nullptr) &&
+        GetLastError() != ERROR_ALREADY_EXISTS)
+        return false;
+    std::wstring temporaryPath = versionDirectory + L"\\MuteAlert.exe.download";
+    std::wstring finalPath = versionDirectory + L"\\MuteAlert.exe";
+    DeleteFileW(temporaryPath.c_str());
+    if (!FetchUrlToFile(status.assetUrl, temporaryPath)) return false;
+    std::wstring actualDigest;
+    std::wstring expectedDigest = status.assetDigest.substr(
+        ARRAYSIZE(digestPrefix) - 1);
+    if (!Sha256File(temporaryPath, actualDigest) ||
+        _wcsicmp(actualDigest.c_str(), expectedDigest.c_str()) != 0) {
+        DeleteFileW(temporaryPath.c_str());
+        return false;
+    }
+    if (!MoveFileExW(temporaryPath.c_str(), finalPath.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(temporaryPath.c_str());
+        return false;
+    }
+    status.state = UpdateCheckState::ReadyToInstall;
+    status.downloadedPath = std::move(finalPath);
+    SetUpdateStatus(std::move(status));
+    PostMessageW(g_mainWindow, kUpdateCheckCompleted, 0, 0);
+    return true;
 }
 
 static void PerformUpdateCheck(bool includePrereleases) {
@@ -2116,7 +2393,9 @@ static void PerformUpdateCheck(bool includePrereleases) {
         if (!version.empty() && (version[0] == L'v' || version[0] == L'V'))
             version.erase(0, 1);
         SetUpdateStatus(UpdateCheckState::Available, std::move(version),
-                        Utf8ToWide(newest.url));
+                        Utf8ToWide(newest.url),
+                        Utf8ToWide(newest.assetUrl),
+                        Utf8ToWide(newest.assetDigest));
     } else {
         SetUpdateStatus(UpdateCheckState::UpToDate);
     }
@@ -2129,6 +2408,7 @@ static DWORD WINAPI UpdateThreadProc(void*) {
     ULONGLONG lastAttempt = 0;
     for (;;) {
         bool manual = g_manualUpdateCheck.exchange(false);
+        bool installRequested = g_installUpdateRequested.exchange(false);
         ULONGLONG now = CurrentUnixSeconds();
         ULONGLONG last = g_lastUpdateCheckTime.load();
         bool due = g_checkForUpdates.load() &&
@@ -2141,6 +2421,23 @@ static DWORD WINAPI UpdateThreadProc(void*) {
             PerformUpdateCheck(manual
                                    ? g_manualIncludePrereleaseUpdates.load()
                                    : g_includePrereleaseUpdates.load());
+        }
+        UpdateStatus status = GetUpdateStatus();
+        bool installAutomatically =
+            g_installUpdatesAutomatically.load() &&
+            status.state == UpdateCheckState::Available;
+        if ((installRequested || installAutomatically) &&
+            status.state == UpdateCheckState::Available) {
+            status.state = UpdateCheckState::Downloading;
+            SetUpdateStatus(status);
+            PostMessageW(g_mainWindow, kUpdateCheckCompleted, 0, 0);
+            status.state = UpdateCheckState::Available;
+            if (!DownloadUpdate(std::move(status))) {
+                status = GetUpdateStatus();
+                status.state = UpdateCheckState::InstallFailed;
+                SetUpdateStatus(std::move(status));
+                PostMessageW(g_mainWindow, kUpdateCheckCompleted, 0, 0);
+            }
         }
 
         DWORD waitMilliseconds = INFINITE;
@@ -2527,6 +2824,19 @@ static void ShowUpdateBalloon(const std::wstring& version) {
     Shell_NotifyIconW(NIM_MODIFY, &data);
 }
 
+static void ShowUpdateInstallFailureBalloon() {
+    NOTIFYICONDATAW data = BaseNotifyData(kMicIconId, kMicIconGuid);
+    data.uFlags = NIF_INFO | NIF_GUID;
+    StringCchCopyW(data.szInfoTitle, ARRAYSIZE(data.szInfoTitle),
+                   L"MuteAlert update needs attention");
+    StringCchCopyW(data.szInfo, ARRAYSIZE(data.szInfo),
+                   L"The update could not be installed automatically. Click "
+                   L"to view the GitHub release.");
+    data.dwInfoFlags = NIIF_WARNING | NIIF_RESPECT_QUIET_TIME;
+    g_updateBalloonActive.store(true);
+    Shell_NotifyIconW(NIM_MODIFY, &data);
+}
+
 static std::wstring BuildHeadsetDiagnostics() {
     SYSTEMTIME now{};
     GetLocalTime(&now);
@@ -2734,9 +3044,11 @@ enum ControlId {
     IDC_HEADSET_EXPORT,
     IDC_UPDATES_AUTOMATIC = 700,
     IDC_UPDATES_PRERELEASE,
+    IDC_UPDATES_AUTOINSTALL,
     IDC_UPDATES_CHECK_NOW,
     IDC_UPDATES_STATUS,
     IDC_UPDATES_VIEW_RELEASE,
+    IDC_UPDATES_INSTALL,
     IDM_SETTINGS = 800,
     IDM_TOGGLE_CALLS,
     IDM_VIEW_UPDATE,
@@ -2885,20 +3197,26 @@ static void CreateUpdatesPage(HWND window) {
              IDC_UPDATES_AUTOMATIC, 32, 126, 400, page);
     AddCheck(window, L"Include pre-release versions",
              IDC_UPDATES_PRERELEASE, 32, 160, 400, page);
-    AddControl(window, L"BUTTON", L"Check now", WS_TABSTOP, 32, 208, 120,
+    AddCheck(window, L"Download, install, and restart automatically",
+             IDC_UPDATES_AUTOINSTALL, 32, 194, 430, page);
+    AddControl(window, L"BUTTON", L"Check now", WS_TABSTOP, 32, 238, 120,
                30, IDC_UPDATES_CHECK_NOW, page);
-    AddControl(window, L"STATIC", L"Not checked yet.", SS_LEFT, 32, 258,
+    AddControl(window, L"STATIC", L"Not checked yet.", SS_LEFT, 32, 282,
                500, 44, IDC_UPDATES_STATUS, page);
     HWND viewRelease = AddControl(window, L"BUTTON", L"View release",
-                                  WS_TABSTOP, 32, 310, 140, 30,
+                                  WS_TABSTOP, 32, 330, 140, 30,
                                   IDC_UPDATES_VIEW_RELEASE, page);
     EnableWindow(viewRelease, FALSE);
+    HWND install = AddControl(window, L"BUTTON", L"Download and install",
+                              WS_TABSTOP, 184, 330, 180, 30,
+                              IDC_UPDATES_INSTALL, page);
+    EnableWindow(install, FALSE);
     AddNote(window,
             L"Update checks make an anonymous request to MuteAlert's public "
             L"GitHub releases. No GitHub account or token is used. MuteAlert "
-            L"only notifies you and never downloads or installs updates "
-            L"automatically.",
-            32, 366, 510, 72, page);
+            L"verifies downloads with GitHub's SHA-256 digest before replacing "
+            L"the app. Store builds use store-managed updates instead.",
+            32, 380, 510, 62, page);
 }
 
 static void ShowSettingsPage(int page) {
@@ -2936,6 +3254,19 @@ static void UpdateUpdateStatusControls(HWND window) {
             break;
         case UpdateCheckState::Available:
             text = L"MuteAlert " + status.version + L" is available.";
+            if (status.assetUrl.empty() || status.assetDigest.empty())
+                text += L" Install this release from GitHub.";
+            break;
+        case UpdateCheckState::Downloading:
+            text = L"Downloading and verifying MuteAlert " + status.version +
+                   L"…";
+            break;
+        case UpdateCheckState::ReadyToInstall:
+            text = L"The update is verified. Restarting MuteAlert…";
+            break;
+        case UpdateCheckState::InstallFailed:
+            text = L"Automatic installation failed. Use View release to "
+                   L"install the update manually.";
             break;
         case UpdateCheckState::Failed:
             text = L"Couldn't check for updates. Check your internet "
@@ -2950,16 +3281,165 @@ static void UpdateUpdateStatusControls(HWND window) {
     EnableWindow(GetDlgItem(window, IDC_UPDATES_CHECK_NOW),
                  status.state != UpdateCheckState::Checking);
     EnableWindow(GetDlgItem(window, IDC_UPDATES_VIEW_RELEASE),
-                 status.state == UpdateCheckState::Available &&
+                 (status.state == UpdateCheckState::Available ||
+                  status.state == UpdateCheckState::InstallFailed) &&
                      !status.releaseUrl.empty());
+    EnableWindow(GetDlgItem(window, IDC_UPDATES_INSTALL),
+                 status.state == UpdateCheckState::Available &&
+                     !status.assetUrl.empty() &&
+                     !status.assetDigest.empty());
 }
 
 static void OpenAvailableRelease() {
     UpdateStatus status = GetUpdateStatus();
-    if (status.state == UpdateCheckState::Available &&
-        !status.releaseUrl.empty())
+    if (!status.releaseUrl.empty())
         ShellExecuteW(nullptr, L"open", status.releaseUrl.c_str(), nullptr,
                       nullptr, SW_SHOWNORMAL);
+}
+
+static std::wstring QuoteCommandLineArgument(const std::wstring& value) {
+    std::wstring result = L"\"";
+    size_t backslashes = 0;
+    for (wchar_t character : value) {
+        if (character == L'\\') {
+            ++backslashes;
+        } else if (character == L'\"') {
+            result.append(backslashes * 2 + 1, L'\\');
+            result.push_back(L'\"');
+            backslashes = 0;
+        } else {
+            result.append(backslashes, L'\\');
+            backslashes = 0;
+            result.push_back(character);
+        }
+    }
+    result.append(backslashes * 2, L'\\');
+    result.push_back(L'\"');
+    return result;
+}
+
+static int ApplyDownloadedUpdate(DWORD processId,
+                                 const std::wstring& targetPath) {
+    if (_wcsicmp(PathFindFileNameW(targetPath.c_str()), L"MuteAlert.exe") != 0)
+        return 2;
+    wchar_t selfBuffer[MAX_PATH];
+    DWORD selfLength = GetModuleFileNameW(nullptr, selfBuffer,
+                                          ARRAYSIZE(selfBuffer));
+    if (selfLength == 0 || selfLength >= ARRAYSIZE(selfBuffer)) return 2;
+    std::wstring selfPath(selfBuffer, selfLength);
+    HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, processId);
+    if (process) {
+        DWORD waitResult = WaitForSingleObject(process, 120000);
+        CloseHandle(process);
+        if (waitResult != WAIT_OBJECT_0) {
+            MessageBoxW(nullptr,
+                        L"MuteAlert did not close in time. The update was not "
+                        L"installed.",
+                        kAppName, MB_OK | MB_ICONERROR);
+            return 3;
+        }
+    }
+
+    std::wstring backupPath = targetPath + L".previous";
+    DeleteFileW(backupPath.c_str());
+    bool movedOriginal =
+        MoveFileExW(targetPath.c_str(), backupPath.c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) !=
+        FALSE;
+    if (!movedOriginal && GetLastError() != ERROR_FILE_NOT_FOUND) {
+        MessageBoxW(nullptr,
+                    L"MuteAlert could not replace the existing executable. "
+                    L"Try moving it to a folder where you have write access, "
+                    L"then update again.",
+                    kAppName, MB_OK | MB_ICONERROR);
+        return 4;
+    }
+    if (!CopyFileW(selfPath.c_str(), targetPath.c_str(), FALSE)) {
+        if (movedOriginal)
+            MoveFileExW(backupPath.c_str(), targetPath.c_str(),
+                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+        MessageBoxW(nullptr, L"The downloaded update could not be installed.",
+                    kAppName, MB_OK | MB_ICONERROR);
+        return 5;
+    }
+
+    std::wstring commandLine = QuoteCommandLineArgument(targetPath) +
+                               L" --cleanup-update " +
+                               QuoteCommandLineArgument(selfPath);
+    STARTUPINFOW startup{sizeof(startup)};
+    PROCESS_INFORMATION information{};
+    if (!CreateProcessW(targetPath.c_str(), commandLine.data(), nullptr,
+                        nullptr, FALSE, 0, nullptr, nullptr, &startup,
+                        &information)) {
+        DeleteFileW(targetPath.c_str());
+        if (movedOriginal)
+            MoveFileExW(backupPath.c_str(), targetPath.c_str(),
+                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+        MessageBoxW(nullptr,
+                    L"The update was installed but could not be started. The "
+                    L"previous version has been restored.",
+                    kAppName, MB_OK | MB_ICONERROR);
+        return 6;
+    }
+    CloseHandle(information.hThread);
+    CloseHandle(information.hProcess);
+    return 0;
+}
+
+static std::optional<int> HandleUpdateCommandLine() {
+    int argumentCount = 0;
+    PWSTR* arguments = CommandLineToArgvW(GetCommandLineW(), &argumentCount);
+    if (!arguments) return std::nullopt;
+    std::optional<int> result;
+    if (argumentCount == 4 &&
+        _wcsicmp(arguments[1], L"--apply-update") == 0) {
+        wchar_t* end = nullptr;
+        unsigned long processId = wcstoul(arguments[2], &end, 10);
+        if (processId != 0 && end && *end == L'\0')
+            result = ApplyDownloadedUpdate(static_cast<DWORD>(processId),
+                                           arguments[3]);
+        else
+            result = 2;
+    } else if (argumentCount == 3 &&
+               _wcsicmp(arguments[1], L"--cleanup-update") == 0) {
+        std::wstring helperPath = arguments[2];
+        for (int attempt = 0; attempt < 20; ++attempt) {
+            if (DeleteFileW(helperPath.c_str()) ||
+                GetLastError() == ERROR_FILE_NOT_FOUND)
+                break;
+            Sleep(100);
+        }
+        size_t slash = helperPath.find_last_of(L"\\/");
+        if (slash != std::wstring::npos)
+            RemoveDirectoryW(helperPath.substr(0, slash).c_str());
+    }
+    LocalFree(arguments);
+    return result;
+}
+
+static bool LaunchDownloadedUpdate(const UpdateStatus& status) {
+    if (status.state != UpdateCheckState::ReadyToInstall ||
+        status.downloadedPath.empty())
+        return false;
+    wchar_t targetBuffer[MAX_PATH];
+    DWORD targetLength = GetModuleFileNameW(nullptr, targetBuffer,
+                                            ARRAYSIZE(targetBuffer));
+    if (targetLength == 0 || targetLength >= ARRAYSIZE(targetBuffer))
+        return false;
+    std::wstring arguments = QuoteCommandLineArgument(status.downloadedPath) +
+                             L" --apply-update " +
+                             std::to_wstring(GetCurrentProcessId()) + L" " +
+                             QuoteCommandLineArgument(
+                                 std::wstring(targetBuffer, targetLength));
+    STARTUPINFOW startup{sizeof(startup)};
+    PROCESS_INFORMATION information{};
+    if (!CreateProcessW(status.downloadedPath.c_str(), arguments.data(),
+                        nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startup,
+                        &information))
+        return false;
+    CloseHandle(information.hThread);
+    CloseHandle(information.hProcess);
+    return true;
 }
 
 static void LoadSettingsControls(HWND window, const Settings& settings) {
@@ -2978,6 +3458,8 @@ static void LoadSettingsControls(HWND window, const Settings& settings) {
     SetCheck(window, IDC_UPDATES_AUTOMATIC, settings.checkForUpdates);
     SetCheck(window, IDC_UPDATES_PRERELEASE,
              settings.includePrereleaseUpdates);
+    SetCheck(window, IDC_UPDATES_AUTOINSTALL,
+             settings.installUpdatesAutomatically);
     auto setApp = [&](int base, bool warning, bool cue, bool toggle,
                       const std::wstring& muted, const std::wstring& marker,
                       int threshold, int delay) {
@@ -3050,6 +3532,9 @@ static Settings ReadSettingsControls(HWND window) {
         IsDlgButtonChecked(window, IDC_UPDATES_AUTOMATIC) == BST_CHECKED;
     settings.includePrereleaseUpdates =
         IsDlgButtonChecked(window, IDC_UPDATES_PRERELEASE) == BST_CHECKED;
+    settings.installUpdatesAutomatically =
+        IsDlgButtonChecked(window, IDC_UPDATES_AUTOINSTALL) == BST_CHECKED;
+    if (settings.installUpdatesAutomatically) settings.checkForUpdates = true;
     auto readApp = [&](int base, bool& warning, bool& cue, bool& toggle,
                        std::wstring& muted, std::wstring& marker,
                        int& threshold, int& delay, PCWSTR defaultMuted,
@@ -3144,6 +3629,8 @@ static LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message,
                     g_checkForUpdates.store(g_settings.checkForUpdates);
                     g_includePrereleaseUpdates.store(
                         g_settings.includePrereleaseUpdates);
+                    g_installUpdatesAutomatically.store(
+                        g_settings.installUpdatesAutomatically);
                     g_pendingVolumeNotches.store(0);
                     g_pendingVolumeSet.store(
                         g_settings.forceVolume ? g_settings.forcedVolume : -1);
@@ -3171,6 +3658,20 @@ static LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message,
                     return 0;
                 case IDC_UPDATES_VIEW_RELEASE:
                     OpenAvailableRelease();
+                    return 0;
+                case IDC_UPDATES_INSTALL:
+                    SetDlgItemTextW(window, IDC_UPDATES_STATUS,
+                                    L"Preparing the update…");
+                    EnableWindow(GetDlgItem(window, IDC_UPDATES_INSTALL),
+                                 FALSE);
+                    g_installUpdateRequested.store(true);
+                    if (g_updateWakeEvent) SetEvent(g_updateWakeEvent);
+                    return 0;
+                case IDC_UPDATES_AUTOINSTALL:
+                    if (IsDlgButtonChecked(window,
+                                           IDC_UPDATES_AUTOINSTALL) ==
+                        BST_CHECKED)
+                        SetCheck(window, IDC_UPDATES_AUTOMATIC, true);
                     return 0;
                 case IDC_CANCEL:
                     DestroyWindow(window);
@@ -3208,7 +3709,8 @@ static void ShowSettings() {
 static void ShowTrayMenu(POINT point) {
     HMENU menu = CreatePopupMenu();
     UpdateStatus update = GetUpdateStatus();
-    if (update.state == UpdateCheckState::Available) {
+    if (update.state == UpdateCheckState::Available ||
+        update.state == UpdateCheckState::InstallFailed) {
         std::wstring label = L"View MuteAlert " + update.version +
                              L" update…";
         AppendMenuW(menu, MF_STRING, IDM_VIEW_UPDATE, label.c_str());
@@ -3363,7 +3865,23 @@ static LRESULT CALLBACK MainWindowProc(HWND window, UINT message,
         case kUpdateCheckCompleted: {
             UpdateUpdateStatusControls(g_settingsWindow);
             UpdateStatus status = GetUpdateStatus();
+            if (status.state == UpdateCheckState::ReadyToInstall) {
+                if (LaunchDownloadedUpdate(status)) {
+                    DestroyWindow(window);
+                    return 0;
+                }
+                status.state = UpdateCheckState::InstallFailed;
+                SetUpdateStatus(status);
+                UpdateUpdateStatusControls(g_settingsWindow);
+                ShowUpdateInstallFailureBalloon();
+                return 0;
+            }
+            if (status.state == UpdateCheckState::InstallFailed) {
+                ShowUpdateInstallFailureBalloon();
+                return 0;
+            }
             if (status.state == UpdateCheckState::Available &&
+                !g_installUpdatesAutomatically.load() &&
                 !status.version.empty() &&
                 status.version != g_lastNotifiedVersion) {
                 g_lastNotifiedVersion = status.version;
@@ -3436,6 +3954,8 @@ static bool InitializeSettingsPath() {
 }
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+    if (std::optional<int> updateResult = HandleUpdateCommandLine())
+        return *updateResult;
     g_instance = instance;
     g_diagnosticStartTime = GetTickCount64();
     g_singleInstance = CreateMutexW(

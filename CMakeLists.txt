@@ -35,6 +35,7 @@ endif()
 
 target_link_libraries(MuteAlert PRIVATE
     advapi32
+    bcrypt
     comdlg32
     comctl32
     gdi32
