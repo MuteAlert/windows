@@ -15,9 +15,9 @@ microphone widget without Windhawk or Explorer injection.
 - Separate Slack, Microsoft Teams, or Zoom call-state icon with app logo,
   mute slash, multiple-call badge, left-click focus, and right-click toggle.
 - Speaking-while-call-muted notification and optional Windows audio cue.
-- Zoom meeting persistence through `CptHost.exe` and an `Alt+A` fallback when
-  Zoom auto-hides its accessible meeting toolbar.
-- Headset mute synchronization through Windows hardware-mute reporting,
+- Zoom meeting persistence through `CptHost.exe`, with an optional, explicitly
+  enabled `Alt+A` fallback when Zoom hides its accessible meeting toolbar.
+- Opt-in headset mute synchronization through Windows hardware-mute reporting,
   standard USB HID microphone/call-mute buttons, and extensible vendor
   adapters.
 - SteelSeries Arctis Nova Pro Wireless support retained as the first
@@ -67,8 +67,9 @@ promote its notification icons.
 
 Slack, Teams, and Zoom are best-effort integrations based on their accessible
 Windows UI labels. Localized or changed labels can be adjusted from Settings.
-Zoom's hidden-toolbar fallback assumes its default `Alt+A` mute shortcut has
-not been customized.
+Zoom's hidden-toolbar fallback is disabled by default because it temporarily
+activates Zoom and sends its default `Alt+A` mute shortcut. Enable it on the
+Zoom Settings page only if that shortcut has not been customized.
 
 Headset hardware is not universal. The application reports one of four
 detection methods: Windows hardware mute, standard HID mute button,
@@ -76,7 +77,8 @@ SteelSeries device state, or unsupported/no observable state. A standard HID
 button is a toggle event and does not by itself prove the position of a
 latched physical switch. Purely mechanical microphone disconnect switches
 cannot be observed by software, and a zero audio level is never interpreted as
-mute.
+mute. Headset synchronization and standard HID monitoring are disabled by
+default; enabling them is an explicit choice on the Headset Settings page.
 
 See [HEADSET_ADAPTERS.md](HEADSET_ADAPTERS.md) for the provider architecture,
 privacy rules for diagnostics, and instructions for adding vendor protocols.

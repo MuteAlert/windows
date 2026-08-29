@@ -46,6 +46,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cwctype>
+#include <exception>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -160,9 +161,9 @@ struct Settings {
     bool includePrereleaseUpdates = true;
     bool installUpdatesAutomatically = false;
 
-    std::wstring headsetMode = L"full";
+    std::wstring headsetMode = L"off";
     bool headsetSyncWindows = true;
-    bool headsetSyncCalls = true;
+    bool headsetSyncCalls = false;
     int headsetPollInterval = 500;
 
     bool slackWarning = true;
@@ -184,6 +185,7 @@ struct Settings {
     bool zoomWarning = true;
     bool zoomAudioCue = true;
     bool zoomToggle = true;
+    bool zoomShortcutFallback = false;
     std::wstring zoomMutedText = L"unmute";
     std::wstring zoomCallText = L"leave|end";
     int zoomThreshold = 8;
@@ -227,6 +229,7 @@ static std::atomic<int> g_pendingMuteSet{-1};
 static std::atomic<int> g_pendingSlackCommand{-1};
 static std::atomic<int> g_pendingTeamsCommand{-1};
 static std::atomic<int> g_pendingZoomCommand{-1};
+static std::atomic<int> g_pendingFocusCall{-1};
 static std::atomic<bool> g_checkForUpdates{true};
 static std::atomic<bool> g_includePrereleaseUpdates{true};
 static std::atomic<bool> g_manualUpdateCheck{false};
@@ -308,6 +311,13 @@ static HANDLE g_callThread;
 static HANDLE g_headsetThread;
 static HANDLE g_updateThread;
 static HANDLE g_updateWakeEvent;
+static std::atomic<bool> g_stateMessageQueued{false};
+static std::atomic<unsigned> g_pendingStateFlags{0};
+static bool g_standardHidRegistered;
+
+static constexpr unsigned kStateMic = 1U << 0;
+static constexpr unsigned kStateCall = 1U << 1;
+static constexpr unsigned kStateHeadset = 1U << 2;
 
 static std::wstring ReadIniString(PCWSTR section, PCWSTR key,
                                   PCWSTR fallback) {
@@ -416,8 +426,16 @@ static void LoadSettings() {
             g_settings.zoomCallText, g_settings.zoomThreshold,
             g_settings.zoomDelay, defaults.zoomMutedText,
             defaults.zoomCallText);
+    g_settings.zoomShortcutFallback = ReadIniBool(
+        L"Zoom", L"ShortcutFallback", defaults.zoomShortcutFallback);
     g_settings.headsetMode =
         ReadIniString(L"Headset", L"Mode", defaults.headsetMode.c_str());
+    if (g_settings.headsetMode != L"full" &&
+        g_settings.headsetMode != L"muteOnly" &&
+        g_settings.headsetMode != L"statusOnly" &&
+        g_settings.headsetMode != L"off") {
+        g_settings.headsetMode = defaults.headsetMode;
+    }
     g_settings.headsetSyncWindows = ReadIniBool(
         L"Headset", L"SyncWindows", defaults.headsetSyncWindows);
     g_settings.headsetSyncCalls = ReadIniBool(
@@ -481,6 +499,8 @@ static void SaveSettings() {
             g_settings.zoomToggle, g_settings.zoomMutedText,
             g_settings.zoomCallText, g_settings.zoomThreshold,
             g_settings.zoomDelay);
+    WriteIniBool(L"Zoom", L"ShortcutFallback",
+                 g_settings.zoomShortcutFallback);
     WriteIniString(L"Headset", L"Mode", g_settings.headsetMode);
     WriteIniBool(L"Headset", L"SyncWindows",
                  g_settings.headsetSyncWindows);
@@ -511,10 +531,15 @@ static void ApplyStartupSetting() {
     RegCloseKey(key);
 }
 
-static void SetDeviceName(std::wstring name) {
+static bool SetDeviceName(std::wstring name) {
+    bool changed = false;
     AcquireSRWLockExclusive(&g_deviceNameLock);
-    g_deviceName = std::move(name);
+    if (g_deviceName != name) {
+        g_deviceName = std::move(name);
+        changed = true;
+    }
     ReleaseSRWLockExclusive(&g_deviceNameLock);
+    return changed;
 }
 
 static std::wstring GetDeviceName() {
@@ -564,11 +589,15 @@ static bool SameHeadsetStatus(const HeadsetStatus& left,
            left.deviceName == right.deviceName && left.detail == right.detail;
 }
 
+static void NotifyMain(unsigned flags);
+
 static void RecomputeHeadsetStatus() {
     bool changed = false;
     AcquireSRWLockExclusive(&g_headsetStatusLock);
     HeadsetStatus next;
-    if (g_steelSeriesDetected) {
+    if (g_settings.headsetMode == L"off") {
+        next.detail = L"Headset mute synchronization is disabled.";
+    } else if (g_steelSeriesDetected) {
         next.detected = true;
         next.stateKnown = true;
         next.muted = g_steelSeriesMuted;
@@ -598,8 +627,7 @@ static void RecomputeHeadsetStatus() {
     changed = !SameHeadsetStatus(g_headsetStatus, next);
     g_headsetStatus = std::move(next);
     ReleaseSRWLockExclusive(&g_headsetStatusLock);
-    if (changed && g_mainWindow)
-        PostMessageW(g_mainWindow, kStateChanged, 0, 0);
+    if (changed) NotifyMain(kStateMic | kStateHeadset);
 }
 
 static void UpdateWindowsHardwareSource(bool supported, bool muted,
@@ -645,8 +673,12 @@ static void RecordDiagnosticEvent(const std::wstring& event) {
     ReleaseSRWLockExclusive(&g_diagnosticLock);
 }
 
-static void NotifyMain() {
-    if (g_mainWindow) PostMessageW(g_mainWindow, kStateChanged, 0, 0);
+static void NotifyMain(unsigned flags) {
+    g_pendingStateFlags.fetch_or(flags);
+    if (!g_mainWindow || g_stateMessageQueued.exchange(true)) return;
+    if (!PostMessageW(g_mainWindow, kStateChanged, 0, 0)) {
+        g_stateMessageQueued.store(false);
+    }
 }
 
 static void QueueVolume(int notches) {
@@ -716,17 +748,17 @@ static int SelectedCall() {
     return -1;
 }
 
-static bool FocusSelectedCall() {
+static HWND CallWindowForIndex(int selected) {
+    return selected == 0   ? g_slackWindow.load()
+           : selected == 1 ? g_teamsWindow.load()
+           : selected == 2 ? g_zoomWindow.load()
+                           : nullptr;
+}
+
+static bool QueueFocusSelectedCall() {
     int selected = SelectedCall();
-    HWND window = selected == 0   ? g_slackWindow.load()
-                  : selected == 1 ? g_teamsWindow.load()
-                  : selected == 2 ? g_zoomWindow.load()
-                                  : nullptr;
-    if (!window || !IsWindow(window)) return false;
-    if (IsIconic(window)) ShowWindowAsync(window, SW_RESTORE);
-    else if (!IsWindowVisible(window)) ShowWindowAsync(window, SW_SHOW);
-    BringWindowToTop(window);
-    SetForegroundWindow(window);
+    if (selected < 0) return false;
+    g_pendingFocusCall.store(selected);
     return true;
 }
 
@@ -803,17 +835,20 @@ static bool OpenDefaultEndpoint(IMMDeviceEnumerator* enumerator,
 }
 
 static void PublishUnavailableAudio() {
-    g_audioAvailable.store(false);
-    g_audioMuted.store(false);
-    g_audioVolume.store(0);
-    g_audioPeak.store(0);
+    bool micChanged = g_audioAvailable.exchange(false);
+    micChanged = g_audioMuted.exchange(false) || micChanged;
+    micChanged = g_audioVolume.exchange(0) != 0 || micChanged;
+    micChanged = g_audioPeak.exchange(0) != 0 || micChanged;
     g_audioLinearPeak.store(0);
-    g_slackWarning.store(false);
-    g_teamsWarning.store(false);
-    g_zoomWarning.store(false);
-    SetDeviceName(L"No microphone available");
-    UpdateWindowsHardwareSource(false, false, L"");
-    NotifyMain();
+    bool callChanged = g_slackWarning.exchange(false);
+    callChanged = g_teamsWarning.exchange(false) || callChanged;
+    callChanged = g_zoomWarning.exchange(false) || callChanged;
+    micChanged = SetDeviceName(L"No microphone available") || micChanged;
+    if (g_settings.headsetMode != L"off")
+        UpdateWindowsHardwareSource(false, false, L"");
+    unsigned flags = (micChanged ? kStateMic : 0) |
+                     (callChanged ? kStateCall : 0);
+    if (flags) NotifyMain(flags);
 }
 
 static DWORD WINAPI AudioThreadProc(void*) {
@@ -834,9 +869,11 @@ static DWORD WINAPI AudioThreadProc(void*) {
     float smoothed = 0;
     ULONGLONG lastEndpointCheck = 0;
     ULONGLONG lastVolumeForce = 0;
+    ULONGLONG lastMeterSample = 0;
     std::wstring observedEndpointId;
     bool observedMuteKnown = false;
     bool observedMuted = false;
+    std::optional<bool> softwareMuteTarget;
     HANDLE waits[] = {g_stopEvent, g_wakeEvent};
     for (;;) {
         DWORD wait = WaitForMultipleObjects(
@@ -849,12 +886,18 @@ static DWORD WINAPI AudioThreadProc(void*) {
             if (!OpenDefaultEndpoint(enumerator.get(), endpoint)) {
                 observedEndpointId.clear();
                 observedMuteKnown = false;
+                softwareMuteTarget.reset();
+                smoothed = 0;
+                lastMeterSample = 0;
                 PublishUnavailableAudio();
                 continue;
             }
             if (observedEndpointId != endpoint.id) {
                 observedEndpointId = endpoint.id;
                 observedMuteKnown = false;
+                softwareMuteTarget.reset();
+                smoothed = 0;
+                lastMeterSample = 0;
             }
         }
         if (!endpoint.device) continue;
@@ -879,11 +922,13 @@ static DWORD WINAPI AudioThreadProc(void*) {
         int muteSet = g_pendingMuteSet.exchange(-1);
         if (muteSet >= 0) {
             g_pendingMuteToggles.exchange(0);
-            endpoint.volume->SetMute(muteSet != 0, nullptr);
+            if (SUCCEEDED(endpoint.volume->SetMute(muteSet != 0, nullptr)))
+                softwareMuteTarget = muteSet != 0;
         } else if (g_pendingMuteToggles.exchange(0) & 1U) {
             BOOL muted = FALSE;
             if (SUCCEEDED(endpoint.volume->GetMute(&muted)))
-                endpoint.volume->SetMute(!muted, nullptr);
+                if (SUCCEEDED(endpoint.volume->SetMute(!muted, nullptr)))
+                    softwareMuteTarget = muted == FALSE;
         }
 
         float peak = 0;
@@ -895,6 +940,9 @@ static DWORD WINAPI AudioThreadProc(void*) {
             endpoint.reset();
             observedEndpointId.clear();
             observedMuteKnown = false;
+            softwareMuteTarget.reset();
+            smoothed = 0;
+            lastMeterSample = 0;
             PublishUnavailableAudio();
             continue;
         }
@@ -916,35 +964,56 @@ static DWORD WINAPI AudioThreadProc(void*) {
             float db = 20.0f * std::log10(scaled);
             display = std::clamp((db + 60.0f) / 60.0f, 0.0f, 1.0f);
         }
-        smoothed += (display - smoothed) * (display > smoothed ? 0.65f : 0.18f);
+        float elapsed = lastMeterSample
+                            ? static_cast<float>(now - lastMeterSample)
+                            : 50.0f;
+        lastMeterSample = now;
+        float base = display > smoothed ? 0.65f : 0.18f;
+        float smoothing = 1.0f -
+                          std::pow(1.0f - base,
+                                   std::clamp(elapsed, 1.0f, 500.0f) / 50.0f);
+        smoothed += (display - smoothed) * smoothing;
         if (smoothed < 0.005f) smoothed = 0;
-        g_audioAvailable.store(true);
-        g_audioMuted.store(muted != FALSE);
-        g_audioVolume.store(static_cast<int>(std::lround(volume * 100)));
-        g_audioPeak.store(muted ? 0 : smoothed);
+        bool mutedNow = muted != FALSE;
+        int volumePercent = static_cast<int>(std::lround(volume * 100));
+        float displayedPeak = mutedNow ? 0 : smoothed;
+        bool micChanged = !g_audioAvailable.exchange(true);
+        micChanged = (g_audioMuted.exchange(mutedNow) != mutedNow) ||
+                     micChanged;
+        micChanged = (g_audioVolume.exchange(volumePercent) !=
+                      volumePercent) || micChanged;
+        float oldPeak = g_audioPeak.exchange(displayedPeak);
+        micChanged = (std::lround(oldPeak * 1000.0f) !=
+                      std::lround(displayedPeak * 1000.0f)) || micChanged;
         g_audioLinearPeak.store(muted ? 0 : scaled);
-        SetDeviceName(endpoint.name);
-        UpdateWindowsHardwareSource(endpoint.hardwareMute, muted != FALSE,
-                                    endpoint.name);
+        micChanged = SetDeviceName(endpoint.name) || micChanged;
+        if (g_settings.headsetMode != L"off")
+            UpdateWindowsHardwareSource(endpoint.hardwareMute, mutedNow,
+                                        endpoint.name);
         if (endpoint.hardwareMute) {
             bool changed = observedMuteKnown &&
-                           observedMuted != (muted != FALSE);
-            bool initialMuted = !observedMuteKnown && muted != FALSE;
+                           observedMuted != mutedNow;
+            bool selfGenerated = false;
+            if (softwareMuteTarget && *softwareMuteTarget == mutedNow) {
+                selfGenerated = changed;
+                softwareMuteTarget.reset();
+            }
             bool syncMute = g_settings.headsetMode == L"full" ||
                             g_settings.headsetMode == L"muteOnly";
             bool syncUnmute = g_settings.headsetMode == L"full";
             if (g_settings.headsetSyncCalls &&
-                ((muted && (changed || initialMuted) && syncMute) ||
-                 (!muted && changed && syncUnmute))) {
-                QueueCallMuteState(muted != FALSE);
+                !selfGenerated &&
+                ((mutedNow && changed && syncMute) ||
+                 (!mutedNow && changed && syncUnmute))) {
+                QueueCallMuteState(mutedNow);
                 RecordDiagnosticEvent(
                     std::wstring(L"Windows hardware mute changed to ") +
-                    (muted ? L"muted" : L"unmuted"));
+                    (mutedNow ? L"muted" : L"unmuted"));
             }
         }
         observedMuteKnown = true;
-        observedMuted = muted != FALSE;
-        NotifyMain();
+        observedMuted = mutedNow;
+        if (micChanged) NotifyMain(kStateMic);
     }
     endpoint.reset();
     enumerator.reset();
@@ -975,13 +1044,14 @@ static bool IsCallWindow(HWND window, CallApp app) {
     HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
                                  processId);
     if (!process) return false;
-    wchar_t path[32768];
-    DWORD length = ARRAYSIZE(path);
+    std::vector<wchar_t> path(32768);
+    DWORD length = static_cast<DWORD>(path.size());
     bool matches = false;
-    if (QueryFullProcessImageNameW(process, 0, path, &length)) {
-        PCWSTR file = path;
+    if (QueryFullProcessImageNameW(process, 0, path.data(), &length)) {
+        PCWSTR file = path.data();
         for (DWORD i = 0; i < length; i++)
-            if (path[i] == L'\\' || path[i] == L'/') file = path + i + 1;
+            if (path[i] == L'\\' || path[i] == L'/')
+                file = path.data() + i + 1;
         if (app == CallApp::Slack)
             matches = _wcsicmp(file, L"slack.exe") == 0;
         else if (app == CallApp::Teams)
@@ -1007,10 +1077,10 @@ static bool ZoomMeetingHostRunning() {
             HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
                                          FALSE, entry.th32ProcessID);
             if (!process) continue;
-            wchar_t path[32768];
-            DWORD length = ARRAYSIZE(path);
-            if (QueryFullProcessImageNameW(process, 0, path, &length) &&
-                Lowercase(std::wstring(path, length)).find(L"\\zoom\\") !=
+            std::vector<wchar_t> path(32768);
+            DWORD length = static_cast<DWORD>(path.size());
+            if (QueryFullProcessImageNameW(process, 0, path.data(), &length) &&
+                Lowercase(std::wstring(path.data(), length)).find(L"\\zoom\\") !=
                     std::wstring::npos)
                 found = true;
             CloseHandle(process);
@@ -1024,28 +1094,22 @@ static bool ZoomMeetingHostRunning() {
 static bool RequestForeground(HWND window) {
     window = GetAncestor(window, GA_ROOT);
     if (!window || !IsWindow(window)) return false;
-    DWORD current = GetCurrentThreadId();
-    DWORD target = GetWindowThreadProcessId(window, nullptr);
-    HWND oldForeground = GetForegroundWindow();
-    DWORD foreground = oldForeground
-                           ? GetWindowThreadProcessId(oldForeground, nullptr)
-                           : 0;
-    bool attachedTarget = target && target != current &&
-                          AttachThreadInput(current, target, TRUE);
-    bool attachedForeground = foreground && foreground != current &&
-                              foreground != target &&
-                              AttachThreadInput(current, foreground, TRUE);
+
+    DWORD_PTR probeResult = 0;
+    if (!SendMessageTimeoutW(window, WM_NULL, 0, 0,
+                             SMTO_ABORTIFHUNG | SMTO_BLOCK, 200,
+                             &probeResult)) {
+        Log(L"Refusing to activate unresponsive call window %p", window);
+        return false;
+    }
     if (IsIconic(window)) ShowWindowAsync(window, SW_RESTORE);
-    BringWindowToTop(window);
+    if (!IsWindowVisible(window)) ShowWindowAsync(window, SW_SHOW);
     SetForegroundWindow(window);
-    SetFocus(window);
     DWORD wantedProcess = 0;
     DWORD actualProcess = 0;
     GetWindowThreadProcessId(window, &wantedProcess);
     if (HWND actual = GetForegroundWindow())
         GetWindowThreadProcessId(actual, &actualProcess);
-    if (attachedForeground) AttachThreadInput(current, foreground, FALSE);
-    if (attachedTarget) AttachThreadInput(current, target, FALSE);
     return wantedProcess && wantedProcess == actualProcess;
 }
 
@@ -1056,7 +1120,10 @@ static bool SendZoomShortcut(HWND callWindow) {
     HWND zoom = GetAncestor(callWindow, GA_ROOT);
     HWND previous = GetForegroundWindow();
     if (!RequestForeground(zoom)) return false;
-    Sleep(20);
+    if (WaitForSingleObject(g_stopEvent, 20) != WAIT_TIMEOUT ||
+        g_exiting.load()) {
+        return false;
+    }
     INPUT input[4]{};
     input[0].type = INPUT_KEYBOARD;
     input[0].ki.wVk = VK_MENU;
@@ -1069,10 +1136,11 @@ static bool SendZoomShortcut(HWND callWindow) {
     input[3].ki.wVk = VK_MENU;
     input[3].ki.dwFlags = KEYEVENTF_KEYUP;
     UINT sent = SendInput(ARRAYSIZE(input), input, sizeof(INPUT));
-    Sleep(40);
+    bool stopping = WaitForSingleObject(g_stopEvent, 40) != WAIT_TIMEOUT ||
+                    g_exiting.load();
     if (previous && previous != zoom && IsWindow(previous))
         RequestForeground(previous);
-    return sent == ARRAYSIZE(input);
+    return !stopping && sent == ARRAYSIZE(input);
 }
 
 static CallState ApplyCommand(CallState state, int command) {
@@ -1231,6 +1299,7 @@ static DWORD WINAPI CallThreadProc(void*) {
     CallState teams = CallState::NotInCall;
     CallState zoom = CallState::NotInCall;
     int deferredZoom = kCallNone;
+    int deferredZoomAttempts = 0;
     bool headsetCalls = g_settings.headsetSyncCalls &&
                         (g_settings.headsetMode == L"full" ||
                          g_settings.headsetMode == L"muteOnly");
@@ -1246,9 +1315,15 @@ static DWORD WINAPI CallThreadProc(void*) {
 
     while (WaitForSingleObject(g_stopEvent, 50) == WAIT_TIMEOUT &&
            !g_exiting.load()) {
+        int focusRequest = g_pendingFocusCall.exchange(-1);
+        if (focusRequest >= 0) {
+            HWND window = CallWindowForIndex(focusRequest);
+            if (window && IsWindow(window)) RequestForeground(window);
+        }
+
         ULONGLONG now = GetTickCount64();
         int slackCommand = g_pendingSlackCommand.exchange(kCallNone);
-        if (!lastSlack || now - lastSlack >= 750 ||
+        if (!lastSlack || now - lastSlack >= 1500 ||
             slackCommand != kCallNone) {
             HWND window = nullptr;
             slack = monitorSlack
@@ -1261,10 +1336,10 @@ static DWORD WINAPI CallThreadProc(void*) {
             bool changed = g_slackActive.exchange(active) != active;
             changed = (g_slackMuted.exchange(muted) != muted) || changed;
             g_slackWindow.store(window);
-            if (changed) NotifyMain();
+            if (changed) NotifyMain(kStateMic | kStateCall);
         }
         int teamsCommand = g_pendingTeamsCommand.exchange(kCallNone);
-        if (!lastTeams || now - lastTeams >= 750 ||
+        if (!lastTeams || now - lastTeams >= 1500 ||
             teamsCommand != kCallNone) {
             HWND window = nullptr;
             teams = monitorTeams
@@ -1277,11 +1352,15 @@ static DWORD WINAPI CallThreadProc(void*) {
             bool changed = g_teamsActive.exchange(active) != active;
             changed = (g_teamsMuted.exchange(muted) != muted) || changed;
             g_teamsWindow.store(window);
-            if (changed) NotifyMain();
+            if (changed) NotifyMain(kStateMic | kStateCall);
         }
         int zoomCommand = g_pendingZoomCommand.exchange(kCallNone);
-        if (zoomCommand != kCallNone) deferredZoom = zoomCommand;
-        if (!lastZoom || now - lastZoom >= 750 || zoomCommand != kCallNone) {
+        if (zoomCommand != kCallNone) {
+            deferredZoom = zoomCommand;
+            deferredZoomAttempts = 0;
+        }
+        if (!lastZoom || now - lastZoom >= 1500 ||
+            zoomCommand != kCallNone) {
             HWND window = nullptr;
             CallState detected =
                 monitorZoom
@@ -1293,9 +1372,22 @@ static DWORD WINAPI CallThreadProc(void*) {
                 if (zoom == CallState::NotInCall) zoom = CallState::Unknown;
                 HWND previous = g_zoomWindow.load();
                 if (!window && IsWindow(previous)) window = previous;
-                if (deferredZoom != kCallNone && SendZoomShortcut(window)) {
-                    zoom = ApplyCommand(zoom, deferredZoom);
-                    deferredZoom = kCallNone;
+                if (deferredZoom != kCallNone) {
+                    if (!g_settings.zoomShortcutFallback) {
+                        Log(L"Zoom Alt+A fallback is disabled; dropping the "
+                            L"deferred command");
+                        deferredZoom = kCallNone;
+                    } else if (deferredZoomAttempts >= 3) {
+                        Log(L"Zoom Alt+A fallback failed three times; "
+                            L"dropping the deferred command");
+                        deferredZoom = kCallNone;
+                    } else {
+                        deferredZoomAttempts++;
+                        if (SendZoomShortcut(window)) {
+                            zoom = ApplyCommand(zoom, deferredZoom);
+                            deferredZoom = kCallNone;
+                        }
+                    }
                 }
             } else {
                 zoom = detected;
@@ -1310,7 +1402,7 @@ static DWORD WINAPI CallThreadProc(void*) {
             changed = (g_zoomMuted.exchange(muted) != muted) || changed;
             changed = (g_zoomKnown.exchange(known) != known) || changed;
             g_zoomWindow.store(window);
-            if (changed) NotifyMain();
+            if (changed) NotifyMain(kStateMic | kStateCall);
         }
 
         bool windowsCanHear = g_audioAvailable.load() &&
@@ -1349,7 +1441,7 @@ static DWORD WINAPI CallThreadProc(void*) {
                 g_settings.zoomThreshold, g_settings.zoomDelay,
                 zoomSpeaking, zoomUntil, g_zoomWarning);
         if (cue) MessageBeep(MB_ICONEXCLAMATION);
-        if (changed) NotifyMain();
+        if (changed) NotifyMain(kStateCall);
     }
     g_slackActive.store(false);
     g_slackMuted.store(false);
@@ -1364,7 +1456,8 @@ static DWORD WINAPI CallThreadProc(void*) {
     g_zoomKnown.store(false);
     g_zoomWarning.store(false);
     g_zoomWindow.store(nullptr);
-    NotifyMain();
+    g_pendingFocusCall.store(-1);
+    NotifyMain(kStateMic | kStateCall);
     automation.reset();
     CoUninitialize();
     return 0;
@@ -1391,6 +1484,7 @@ struct StandardHidMetadata {
     bool systemMicrophoneMute = false;
     bool phoneMute = false;
     bool callMuteToggle = false;
+    bool usesReportIds = false;
     std::wstring manufacturer;
     std::wstring product;
 
@@ -1400,6 +1494,10 @@ struct StandardHidMetadata {
 };
 
 struct StandardHidRuntime {
+    bool metadataLoaded = false;
+    bool metadataValid = false;
+    StandardHidMetadata metadata;
+    std::vector<BYTE> preparsedStorage;
     std::unordered_map<unsigned, unsigned> activeMasks;
     std::unordered_map<unsigned, std::vector<BYTE>> previousReports;
 };
@@ -1424,9 +1522,10 @@ static std::wstring Hex4(USHORT value) {
 
 static bool GetRawHidPreparsedData(HANDLE device, std::vector<BYTE>& storage,
                                    HIDP_CAPS& caps) {
+    constexpr UINT kMaximumPreparsedBytes = 1024U * 1024U;
     UINT size = 0;
     GetRawInputDeviceInfoW(device, RIDI_PREPARSEDDATA, nullptr, &size);
-    if (!size) return false;
+    if (!size || size > kMaximumPreparsedBytes) return false;
     storage.resize(size);
     if (GetRawInputDeviceInfoW(device, RIDI_PREPARSEDDATA, storage.data(),
                                &size) == static_cast<UINT>(-1))
@@ -1473,6 +1572,31 @@ static bool InputCapsContainUsage(PHIDP_PREPARSED_DATA preparsed,
             for (USHORT index = 0; index < valueCount; index++) {
                 if (ValueCapsContains(values[index], page, usage))
                     return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool InputCapsUseReportIds(PHIDP_PREPARSED_DATA preparsed,
+                                  const HIDP_CAPS& caps) {
+    USHORT buttonCount = caps.NumberInputButtonCaps;
+    if (buttonCount) {
+        std::vector<HIDP_BUTTON_CAPS> buttons(buttonCount);
+        if (HidP_GetButtonCaps(HidP_Input, buttons.data(), &buttonCount,
+                               preparsed) == HIDP_STATUS_SUCCESS) {
+            for (USHORT index = 0; index < buttonCount; index++) {
+                if (buttons[index].ReportID != 0) return true;
+            }
+        }
+    }
+    USHORT valueCount = caps.NumberInputValueCaps;
+    if (valueCount) {
+        std::vector<HIDP_VALUE_CAPS> values(valueCount);
+        if (HidP_GetValueCaps(HidP_Input, values.data(), &valueCount,
+                              preparsed) == HIDP_STATUS_SUCCESS) {
+            for (USHORT index = 0; index < valueCount; index++) {
+                if (values[index].ReportID != 0) return true;
             }
         }
     }
@@ -1533,6 +1657,7 @@ static bool ReadStandardHidMetadata(HANDLE device,
         preparsed, caps, kHidUsagePageTelephony, kHidUsagePhoneMute);
     metadata.callMuteToggle = InputCapsContainUsage(
         preparsed, caps, kHidUsagePageTelephony, kHidUsageCallMuteToggle);
+    metadata.usesReportIds = InputCapsUseReportIds(preparsed, caps);
     metadata.manufacturer = RawHidString(device, false);
     metadata.product = RawHidString(device, true);
     return true;
@@ -1658,6 +1783,10 @@ static std::wstring StandardUsageDescription(
 }
 
 static void RefreshStandardHidDevices() {
+    if (!g_standardHidRegistered) {
+        UpdateStandardHidSource(false, L"", L"");
+        return;
+    }
     UINT count = 0;
     if (GetRawInputDeviceList(nullptr, &count, sizeof(RAWINPUTDEVICELIST)) ==
             static_cast<UINT>(-1) ||
@@ -1716,31 +1845,45 @@ static void RecordSanitizedReportChange(
 }
 
 static void ProcessStandardHidRawInput(HRAWINPUT inputHandle) {
+    constexpr UINT kMaximumRawInputBytes = 1024U * 1024U;
+    if (!g_standardHidRegistered) return;
     UINT size = 0;
     GetRawInputData(inputHandle, RID_INPUT, nullptr, &size,
                     sizeof(RAWINPUTHEADER));
-    if (!size) return;
+    if (!size || size > kMaximumRawInputBytes) return;
     std::vector<BYTE> inputStorage(size);
     if (GetRawInputData(inputHandle, RID_INPUT, inputStorage.data(), &size,
                         sizeof(RAWINPUTHEADER)) == static_cast<UINT>(-1))
         return;
     auto* input = reinterpret_cast<RAWINPUT*>(inputStorage.data());
     if (input->header.dwType != RIM_TYPEHID) return;
-
-    std::vector<BYTE> preparsedStorage;
-    StandardHidMetadata metadata;
-    if (!ReadStandardHidMetadata(input->header.hDevice, metadata,
-                                 &preparsedStorage) ||
-        !metadata.HasStandardMuteUsage())
-        return;
-    auto* preparsed =
-        reinterpret_cast<PHIDP_PREPARSED_DATA>(preparsedStorage.data());
     auto& runtime = g_standardHidRuntime[input->header.hDevice];
-    for (DWORD index = 0; index < input->data.hid.dwCount; index++) {
+    if (!runtime.metadataLoaded) {
+        runtime.metadataLoaded = true;
+        runtime.metadataValid = ReadStandardHidMetadata(
+            input->header.hDevice, runtime.metadata,
+            &runtime.preparsedStorage) &&
+                                runtime.metadata.HasStandardMuteUsage();
+    }
+    if (!runtime.metadataValid || runtime.preparsedStorage.empty()) return;
+    auto* preparsed = reinterpret_cast<PHIDP_PREPARSED_DATA>(
+        runtime.preparsedStorage.data());
+    const StandardHidMetadata& metadata = runtime.metadata;
+    DWORD reportLength = input->data.hid.dwSizeHid;
+    DWORD reportCount = input->data.hid.dwCount;
+    size_t rawOffset = reinterpret_cast<const BYTE*>(
+                           input->data.hid.bRawData) -
+                       inputStorage.data();
+    size_t available = inputStorage.size() > rawOffset
+                           ? inputStorage.size() - rawOffset
+                           : 0;
+    if (!reportLength || !reportCount ||
+        reportCount > available / reportLength)
+        return;
+    for (DWORD index = 0; index < reportCount; index++) {
         const BYTE* report = input->data.hid.bRawData +
-                             index * input->data.hid.dwSizeHid;
-        DWORD reportLength = input->data.hid.dwSizeHid;
-        unsigned reportKey = reportLength ? report[0] : 0;
+                             index * reportLength;
+        unsigned reportKey = metadata.usesReportIds ? report[0] : 0;
         unsigned mask = StandardMuteMask(preparsed, metadata, report,
                                          reportLength);
         RecordSanitizedReportChange(metadata, runtime, report, reportLength,
@@ -1781,6 +1924,42 @@ static bool RegisterStandardHidInput() {
     devices[1].hwndTarget = g_mainWindow;
     return RegisterRawInputDevices(devices, ARRAYSIZE(devices),
                                    sizeof(devices[0])) != FALSE;
+}
+
+static void UnregisterStandardHidInput() {
+    RAWINPUTDEVICE devices[2]{};
+    devices[0].usUsagePage = kHidUsagePageGeneric;
+    devices[0].usUsage = kHidUsageSystemControl;
+    devices[0].dwFlags = RIDEV_REMOVE;
+    devices[1].usUsagePage = kHidUsagePageTelephony;
+    devices[1].usUsage = 0;
+    devices[1].dwFlags = RIDEV_REMOVE | RIDEV_PAGEONLY;
+    if (!RegisterRawInputDevices(devices, ARRAYSIZE(devices),
+                                 sizeof(devices[0]))) {
+        Log(L"Standard HID raw-input removal failed: %u", GetLastError());
+    }
+}
+
+static void ApplyStandardHidRegistration() {
+    bool shouldRegister = g_settings.headsetMode != L"off";
+    if (shouldRegister == g_standardHidRegistered) return;
+    if (shouldRegister) {
+        if (!RegisterStandardHidInput()) {
+            RecordDiagnosticEvent(
+                L"Standard HID raw-input registration failed");
+            return;
+        }
+        g_standardHidRegistered = true;
+        RefreshStandardHidDevices();
+        return;
+    }
+    UnregisterStandardHidInput();
+    g_standardHidRegistered = false;
+    KillTimer(g_mainWindow, kStandardHidTimer);
+    g_pendingStandardHidAction = {};
+    g_standardHidRuntime.clear();
+    UpdateStandardHidSource(false, L"", L"");
+    UpdateWindowsHardwareSource(false, false, L"");
 }
 
 static DWORD WINAPI HeadsetThreadProc(void*) {
@@ -2090,7 +2269,8 @@ static bool FetchReleaseJson(std::string& response) {
     constexpr wchar_t headers[] =
         L"Accept: application/vnd.github+json\r\n"
         L"X-GitHub-Api-Version: 2026-03-10\r\n";
-    if (!WinHttpSendRequest(request.get(), headers, static_cast<DWORD>(-1),
+    if (!WinHttpSendRequest(request.get(), headers,
+                            static_cast<DWORD>(ARRAYSIZE(headers) - 1),
                             WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
         !WinHttpReceiveResponse(request.get(), nullptr))
         return false;
@@ -2281,6 +2461,7 @@ static bool Sha256File(const std::wstring& path, std::wstring& digest) {
     DWORD resultLength = 0;
     std::vector<unsigned char> object;
     std::vector<unsigned char> result;
+    std::vector<unsigned char> buffer(64 * 1024);
     if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(
             &algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0)) ||
         !BCRYPT_SUCCESS(BCryptGetProperty(
@@ -2301,12 +2482,12 @@ static bool Sha256File(const std::wstring& path, std::wstring& digest) {
                        OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (file == INVALID_HANDLE_VALUE) goto cleanup;
     for (;;) {
-        unsigned char buffer[64 * 1024];
         DWORD read = 0;
-        if (!ReadFile(file, buffer, sizeof(buffer), &read, nullptr))
+        if (!ReadFile(file, buffer.data(),
+                      static_cast<DWORD>(buffer.size()), &read, nullptr))
             goto cleanup;
         if (read == 0) break;
-        if (!BCRYPT_SUCCESS(BCryptHashData(hash, buffer, read, 0)))
+        if (!BCRYPT_SUCCESS(BCryptHashData(hash, buffer.data(), read, 0)))
             goto cleanup;
     }
     if (!BCRYPT_SUCCESS(
@@ -2468,6 +2649,71 @@ static DWORD WINAPI UpdateThreadProc(void*) {
     return 0;
 }
 
+static void LogWorkerException(PCWSTR worker,
+                               const std::exception* exception = nullptr) {
+    if (exception)
+        Log(L"%ls worker stopped after an exception: %hs", worker,
+            exception->what());
+    else
+        Log(L"%ls worker stopped after an unknown exception", worker);
+}
+
+static DWORD WINAPI SafeAudioThreadProc(void*) noexcept {
+    try {
+        return AudioThreadProc(nullptr);
+    } catch (const std::exception& exception) {
+        LogWorkerException(L"Audio", &exception);
+    } catch (...) {
+        LogWorkerException(L"Audio");
+    }
+    PublishUnavailableAudio();
+    return 0;
+}
+
+static DWORD WINAPI SafeCallThreadProc(void*) noexcept {
+    try {
+        return CallThreadProc(nullptr);
+    } catch (const std::exception& exception) {
+        LogWorkerException(L"Call", &exception);
+    } catch (...) {
+        LogWorkerException(L"Call");
+    }
+    g_slackActive.store(false);
+    g_teamsActive.store(false);
+    g_zoomActive.store(false);
+    g_slackWarning.store(false);
+    g_teamsWarning.store(false);
+    g_zoomWarning.store(false);
+    NotifyMain(kStateMic | kStateCall);
+    return 0;
+}
+
+static DWORD WINAPI SafeHeadsetThreadProc(void*) noexcept {
+    try {
+        return HeadsetThreadProc(nullptr);
+    } catch (const std::exception& exception) {
+        LogWorkerException(L"Headset", &exception);
+    } catch (...) {
+        LogWorkerException(L"Headset");
+    }
+    UpdateSteelSeriesSource(false, false, L"", L"");
+    return 0;
+}
+
+static DWORD WINAPI SafeUpdateThreadProc(void*) noexcept {
+    try {
+        return UpdateThreadProc(nullptr);
+    } catch (const std::exception& exception) {
+        LogWorkerException(L"Update", &exception);
+    } catch (...) {
+        LogWorkerException(L"Update");
+    }
+    SetUpdateStatus(UpdateCheckState::Failed);
+    if (g_mainWindow)
+        PostMessageW(g_mainWindow, kUpdateCheckCompleted, 0, 0);
+    return 0;
+}
+
 static bool StartWorkers() {
     g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_wakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -2479,8 +2725,17 @@ static bool StartWorkers() {
         g_stopEvent = g_wakeEvent = g_updateWakeEvent = nullptr;
         return false;
     }
-    g_audioThread = CreateThread(nullptr, 0, AudioThreadProc, nullptr, 0,
+    g_audioThread = CreateThread(nullptr, 0, SafeAudioThreadProc, nullptr, 0,
                                  nullptr);
+    if (!g_audioThread) {
+        Log(L"Microphone monitoring thread creation failed: %u",
+            GetLastError());
+        CloseHandle(g_stopEvent);
+        CloseHandle(g_wakeEvent);
+        CloseHandle(g_updateWakeEvent);
+        g_stopEvent = g_wakeEvent = g_updateWakeEvent = nullptr;
+        return false;
+    }
     bool headsetCalls = g_settings.headsetSyncCalls &&
                         (g_settings.headsetMode == L"full" ||
                          g_settings.headsetMode == L"muteOnly");
@@ -2488,14 +2743,26 @@ static bool StartWorkers() {
         g_settings.slackToggle || g_settings.teamsWarning ||
         g_settings.teamsToggle || g_settings.zoomWarning ||
         g_settings.zoomToggle || headsetCalls)
-        g_callThread = CreateThread(nullptr, 0, CallThreadProc, nullptr, 0,
+        g_callThread = CreateThread(nullptr, 0, SafeCallThreadProc, nullptr, 0,
                                     nullptr);
+    if (!g_callThread &&
+        (g_settings.showCallStateIcon || g_settings.slackWarning ||
+         g_settings.slackToggle || g_settings.teamsWarning ||
+         g_settings.teamsToggle || g_settings.zoomWarning ||
+         g_settings.zoomToggle || headsetCalls)) {
+        Log(L"Call monitoring thread creation failed: %u", GetLastError());
+    }
     if (g_settings.headsetMode != L"off")
-        g_headsetThread = CreateThread(nullptr, 0, HeadsetThreadProc, nullptr,
+        g_headsetThread = CreateThread(nullptr, 0, SafeHeadsetThreadProc, nullptr,
                                        0, nullptr);
-    g_updateThread = CreateThread(nullptr, 0, UpdateThreadProc, nullptr, 0,
+    if (!g_headsetThread && g_settings.headsetMode != L"off")
+        Log(L"Headset monitoring thread creation failed: %u",
+            GetLastError());
+    g_updateThread = CreateThread(nullptr, 0, SafeUpdateThreadProc, nullptr, 0,
                                   nullptr);
-    return g_audioThread != nullptr;
+    if (!g_updateThread)
+        Log(L"Update monitoring thread creation failed: %u", GetLastError());
+    return true;
 }
 
 static void StopWorkers() {
@@ -2744,22 +3011,27 @@ static void RemoveTrayIcon(UINT id, const GUID& guid) {
     Shell_NotifyIconW(NIM_DELETE, &data);
 }
 
-static void UpdateTrayIcons(bool forceAdd = false) {
-    HICON mic = CreateMicrophoneIcon();
-    if (!g_micIconAdded || forceAdd) {
-        if (forceAdd && g_micIconAdded) RemoveTrayIcon(kMicIconId, kMicIconGuid);
-        g_micIconAdded = AddTrayIcon(kMicIconId, kMicIconGuid, mic,
-                                     MicTooltip());
-    } else {
-        NOTIFYICONDATAW data = BaseNotifyData(kMicIconId, kMicIconGuid);
-        data.uFlags = NIF_ICON | NIF_TIP | NIF_GUID | NIF_SHOWTIP;
-        data.hIcon = mic;
-        CopyTooltip(data.szTip, ARRAYSIZE(data.szTip), MicTooltip());
-        Shell_NotifyIconW(NIM_MODIFY, &data);
+static void UpdateTrayIcons(bool forceAdd = false, bool updateMic = true,
+                            bool updateCall = true) {
+    if (updateMic || forceAdd) {
+        HICON mic = CreateMicrophoneIcon();
+        if (!g_micIconAdded || forceAdd) {
+            if (forceAdd && g_micIconAdded)
+                RemoveTrayIcon(kMicIconId, kMicIconGuid);
+            g_micIconAdded = AddTrayIcon(kMicIconId, kMicIconGuid, mic,
+                                         MicTooltip());
+        } else {
+            NOTIFYICONDATAW data = BaseNotifyData(kMicIconId, kMicIconGuid);
+            data.uFlags = NIF_ICON | NIF_TIP | NIF_GUID | NIF_SHOWTIP;
+            data.hIcon = mic;
+            CopyTooltip(data.szTip, ARRAYSIZE(data.szTip), MicTooltip());
+            Shell_NotifyIconW(NIM_MODIFY, &data);
+        }
+        if (g_micIcon) DestroyIcon(g_micIcon);
+        g_micIcon = mic;
     }
-    if (g_micIcon) DestroyIcon(g_micIcon);
-    g_micIcon = mic;
 
+    if (!updateCall && !forceAdd) return;
     bool showCall = g_settings.showCallStateIcon && SelectedCall() >= 0;
     if (showCall) {
         HICON call = CreateCallIcon();
@@ -3035,6 +3307,7 @@ enum ControlId {
     IDC_ZOOM_CALL_TEXT,
     IDC_ZOOM_THRESHOLD,
     IDC_ZOOM_DELAY,
+    IDC_ZOOM_SHORTCUT_FALLBACK,
     IDC_HEADSET_MODE = 600,
     IDC_HEADSET_WINDOWS,
     IDC_HEADSET_CALLS,
@@ -3144,10 +3417,19 @@ static void CreateCallPage(HWND window, int page, PCWSTR appName, int base,
     AddEdit(window, base + 5, 270, 294, 90, page);
     AddLabel(window, L"Speech delay (100–3000 ms)", 32, 342, 230, page);
     AddEdit(window, base + 6, 270, 338, 90, page);
+    int noteY = 392;
+    int noteHeight = 44;
+    if (base == IDC_ZOOM_WARNING) {
+        AddCheck(window,
+                 L"Allow Alt+A fallback when Zoom controls are hidden",
+                 IDC_ZOOM_SHORTCUT_FALLBACK, 32, 374, 450, page);
+        noteY = 410;
+        noteHeight = 30;
+    }
     std::wstring note = L"Separate alternative labels with |. Default call "
                         L"marker: ";
     note += markerExample;
-    AddNote(window, note.c_str(), 32, 392, 510, 44, page);
+    AddNote(window, note.c_str(), 32, noteY, 510, noteHeight, page);
 }
 
 static void CreateHeadsetPage(HWND window) {
@@ -3181,9 +3463,9 @@ static void CreateHeadsetPage(HWND window) {
     AddControl(window, L"BUTTON", L"Export headset diagnostics…",
                WS_TABSTOP, 32, 310, 220, 30, IDC_HEADSET_EXPORT, page);
     AddNote(window,
-            L"Core Audio and standard HID devices are detected automatically. "
-            L"SteelSeries uses a vendor adapter. Silence is never interpreted "
-            L"as a physical mute state.",
+            L"Synchronization is opt-in. Standard HID and vendor headset "
+            L"monitoring run only while enabled. Windows hardware mute uses "
+            L"Core Audio. Silence is never treated as physical mute.",
             32, 358, 510, 62, page);
 }
 
@@ -3483,6 +3765,8 @@ static void LoadSettingsControls(HWND window, const Settings& settings) {
            settings.zoomToggle, settings.zoomMutedText,
            settings.zoomCallText, settings.zoomThreshold,
            settings.zoomDelay);
+    SetCheck(window, IDC_ZOOM_SHORTCUT_FALLBACK,
+             settings.zoomShortcutFallback);
     int mode = settings.headsetMode == L"muteOnly" ? 1
                : settings.headsetMode == L"statusOnly" ? 2
                : settings.headsetMode == L"off"        ? 3
@@ -3560,6 +3844,9 @@ static Settings ReadSettingsControls(HWND window) {
             settings.zoomToggle, settings.zoomMutedText,
             settings.zoomCallText, settings.zoomThreshold,
             settings.zoomDelay, L"unmute", L"leave|end");
+    settings.zoomShortcutFallback =
+        IsDlgButtonChecked(window, IDC_ZOOM_SHORTCUT_FALLBACK) ==
+        BST_CHECKED;
     int mode = static_cast<int>(SendDlgItemMessageW(
         window, IDC_HEADSET_MODE, CB_GETCURSEL, 0, 0));
     settings.headsetMode = mode == 1 ? L"muteOnly"
@@ -3636,8 +3923,10 @@ static LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message,
                         g_settings.forceVolume ? g_settings.forcedVolume : -1);
                     SaveSettings();
                     ApplyStartupSetting();
+                    ApplyStandardHidRegistration();
+                    RecomputeHeadsetStatus();
                     StartWorkers();
-                    UpdateTrayIcons();
+                    UpdateTrayIcons(false, true, true);
                     DestroyWindow(window);
                     return 0;
                 }
@@ -3783,15 +4072,15 @@ static void ShowTrayMenu(POINT point) {
 static void HandleTrayEvent(WPARAM wParam, LPARAM lParam) {
     UINT event = LOWORD(lParam);
     UINT iconId = HIWORD(lParam);
-    static DWORD lastSelectTime = 0;
+    static ULONGLONG lastSelectTime = 0;
     static UINT lastSelectIcon = 0;
     if (event == NIN_SELECT || event == WM_LBUTTONUP) {
-        DWORD now = GetTickCount();
+        ULONGLONG now = GetTickCount64();
         if (iconId == lastSelectIcon && now - lastSelectTime < 180) return;
         lastSelectIcon = iconId;
         lastSelectTime = now;
         if (iconId == kMicIconId) QueueWindowsToggle();
-        else if (iconId == kCallIconId) FocusSelectedCall();
+        else if (iconId == kCallIconId) QueueFocusSelectedCall();
         return;
     }
     if (event == WM_MBUTTONUP) {
@@ -3854,12 +4143,21 @@ static LRESULT CALLBACK MainWindowProc(HWND window, UINT message,
             HandleTrayEvent(wParam, lParam);
             return 0;
         case kStateChanged: {
-            UpdateTrayIcons();
-            UpdateHeadsetStatusControls(g_settingsWindow);
-            bool warning = g_slackWarning.load() || g_teamsWarning.load() ||
-                           g_zoomWarning.load();
-            if (warning && !g_previousWarning) ShowWarningBalloon();
-            g_previousWarning = warning;
+            g_stateMessageQueued.store(false);
+            unsigned flags = g_pendingStateFlags.exchange(0);
+            bool callChanged = (flags & kStateCall) != 0;
+            bool micChanged =
+                (flags & (kStateMic | kStateCall | kStateHeadset)) != 0;
+            UpdateTrayIcons(false, micChanged, callChanged);
+            if (flags & kStateHeadset)
+                UpdateHeadsetStatusControls(g_settingsWindow);
+            if (callChanged) {
+                bool warning = g_slackWarning.load() ||
+                               g_teamsWarning.load() ||
+                               g_zoomWarning.load();
+                if (warning && !g_previousWarning) ShowWarningBalloon();
+                g_previousWarning = warning;
+            }
             return 0;
         }
         case kUpdateCheckCompleted: {
@@ -3892,12 +4190,20 @@ static LRESULT CALLBACK MainWindowProc(HWND window, UINT message,
             return 0;
         }
         case WM_INPUT:
-            ProcessStandardHidRawInput(
-                reinterpret_cast<HRAWINPUT>(lParam));
+            if (g_standardHidRegistered) {
+                try {
+                    ProcessStandardHidRawInput(
+                        reinterpret_cast<HRAWINPUT>(lParam));
+                } catch (...) {
+                    Log(L"Ignoring an exception while processing HID input");
+                }
+            }
             return DefWindowProcW(window, message, wParam, lParam);
         case WM_INPUT_DEVICE_CHANGE:
-            g_standardHidRuntime.clear();
-            RefreshStandardHidDevices();
+            if (g_standardHidRegistered) {
+                g_standardHidRuntime.clear();
+                RefreshStandardHidDevices();
+            }
             return 0;
         case WM_TIMER:
             if (wParam == kStandardHidTimer) {
@@ -3934,6 +4240,8 @@ static LRESULT CALLBACK MainWindowProc(HWND window, UINT message,
             if (wParam) DestroyWindow(window);
             return 0;
         case WM_DESTROY:
+            g_stateMessageQueued.store(false);
+            g_pendingStateFlags.store(0);
             PostQuitMessage(0);
             return 0;
     }
@@ -3953,7 +4261,12 @@ static bool InitializeSettingsPath() {
     return true;
 }
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+int WINAPI wWinMain(_In_ HINSTANCE instance,
+                    _In_opt_ HINSTANCE previousInstance,
+                    _In_ PWSTR commandLine, _In_ int showCommand) {
+    UNREFERENCED_PARAMETER(previousInstance);
+    UNREFERENCED_PARAMETER(commandLine);
+    UNREFERENCED_PARAMETER(showCommand);
     if (std::optional<int> updateResult = HandleUpdateCommandLine())
         return *updateResult;
     g_instance = instance;
@@ -4011,9 +4324,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
                                    kWindowClass, kAppName, WS_POPUP, 0, 0, 1,
                                    1, nullptr, nullptr, instance, nullptr);
     if (!g_mainWindow) return 1;
-    if (!RegisterStandardHidInput())
-        RecordDiagnosticEvent(L"Standard HID raw-input registration failed");
-    RefreshStandardHidDevices();
+    ApplyStandardHidRegistration();
+    RecomputeHeadsetStatus();
     g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     UpdateTrayIcons(true);
     g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseHookProc, instance, 0);
@@ -4032,6 +4344,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
 
     g_exiting.store(true);
     StopWorkers();
+    if (g_standardHidRegistered) {
+        UnregisterStandardHidInput();
+        g_standardHidRegistered = false;
+    }
     if (g_mouseHook) UnhookWindowsHookEx(g_mouseHook);
     if (g_callIconAdded) RemoveTrayIcon(kCallIconId, kCallIconGuid);
     if (g_micIconAdded) RemoveTrayIcon(kMicIconId, kMicIconGuid);
