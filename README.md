@@ -12,7 +12,8 @@ microphone widget without Windhawk or Explorer injection.
   the locked target while the feature is enabled.
 - Compact hover help showing the active device, volume, mute state, and mouse
   controls.
-- Separate Slack, Microsoft Teams, or Zoom call-state icon with app logo,
+- Separate Slack, Microsoft Teams, Zoom, or Google Meet call-state icon with
+  app logo,
   mute slash, multiple-call badge, left-click focus, and right-click toggle.
 - Speaking-while-call-muted notification and optional Windows audio cue.
 - Zoom meeting persistence through `CptHost.exe`, with an optional, explicitly
@@ -25,7 +26,8 @@ microphone widget without Windhawk or Explorer injection.
 - Headset detection method and confidence shown in Settings, with a sanitized
   diagnostics export for adding more devices without exposing serial numbers,
   device paths, or raw HID values.
-- Tabbed settings panel with General, Slack, Teams, Zoom, and Headset pages.
+- Tabbed settings panel with General, Slack, Teams, Zoom, Google Meet, and
+  Headset pages.
 - Embedded multi-resolution microphone application icon for Explorer,
   shortcuts, the taskbar, and Settings windows.
 - Settings stored at `%LOCALAPPDATA%\MuteAlert\settings.ini`.
@@ -65,8 +67,11 @@ promote its notification icons.
 
 ## Integration limitations
 
-Slack, Teams, and Zoom are best-effort integrations based on their accessible
-Windows UI labels. Localized or changed labels can be adjusted from Settings.
+Slack, Teams, Zoom, and Google Meet are best-effort integrations based on their
+accessible Windows UI labels. Localized or changed labels can be adjusted from
+Settings. Google Meet currently requires the meeting tab to be the active tab
+in Chrome, Edge, Firefox, Brave, Vivaldi, Opera, or Arc so that its controls
+are exposed to Windows UI Automation.
 Zoom's hidden-toolbar fallback is disabled by default because it temporarily
 activates Zoom and sends its default `Alt+A` mute shortcut. Enable it on the
 Zoom Settings page only if that shortcut has not been customized.

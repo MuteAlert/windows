@@ -170,6 +170,7 @@ struct Settings {
     bool slackAudioCue = true;
     bool slackToggle = true;
     std::wstring slackMutedText = L"unmute";
+    std::wstring slackUnmutedText = L"mute";
     std::wstring slackCallText = L"leave";
     int slackThreshold = 8;
     int slackDelay = 500;
@@ -178,6 +179,7 @@ struct Settings {
     bool teamsAudioCue = true;
     bool teamsToggle = true;
     std::wstring teamsMutedText = L"unmute";
+    std::wstring teamsUnmutedText = L"mute";
     std::wstring teamsCallText = L"hang up|leave";
     int teamsThreshold = 8;
     int teamsDelay = 500;
@@ -187,9 +189,19 @@ struct Settings {
     bool zoomToggle = true;
     bool zoomShortcutFallback = false;
     std::wstring zoomMutedText = L"unmute";
+    std::wstring zoomUnmutedText = L"mute";
     std::wstring zoomCallText = L"leave|end";
     int zoomThreshold = 8;
     int zoomDelay = 500;
+
+    bool meetWarning = true;
+    bool meetAudioCue = true;
+    bool meetToggle = true;
+    std::wstring meetMutedText = L"turn on microphone";
+    std::wstring meetUnmutedText = L"turn off microphone";
+    std::wstring meetCallText = L"leave call";
+    int meetThreshold = 8;
+    int meetDelay = 500;
 };
 
 static Settings g_settings;
@@ -229,6 +241,7 @@ static std::atomic<int> g_pendingMuteSet{-1};
 static std::atomic<int> g_pendingSlackCommand{-1};
 static std::atomic<int> g_pendingTeamsCommand{-1};
 static std::atomic<int> g_pendingZoomCommand{-1};
+static std::atomic<int> g_pendingMeetCommand{-1};
 static std::atomic<int> g_pendingFocusCall{-1};
 static std::atomic<bool> g_checkForUpdates{true};
 static std::atomic<bool> g_includePrereleaseUpdates{true};
@@ -249,6 +262,10 @@ static std::atomic<bool> g_zoomMuted{false};
 static std::atomic<bool> g_zoomKnown{false};
 static std::atomic<bool> g_zoomWarning{false};
 static std::atomic<HWND> g_zoomWindow{nullptr};
+static std::atomic<bool> g_meetActive{false};
+static std::atomic<bool> g_meetMuted{false};
+static std::atomic<bool> g_meetWarning{false};
+static std::atomic<HWND> g_meetWindow{nullptr};
 static SRWLOCK g_deviceNameLock = SRWLOCK_INIT;
 static std::wstring g_deviceName = L"No microphone available";
 
@@ -400,32 +417,48 @@ static void LoadSettings() {
         ReadIniUInt64(L"Updates", L"LastSuccessfulCheck", 0));
 
     auto loadApp = [&](PCWSTR section, bool& warning, bool& cue, bool& toggle,
-                       std::wstring& mutedText, std::wstring& callText,
-                       int& threshold, int& delay, const std::wstring& dMuted,
+                       std::wstring& mutedText, std::wstring& unmutedText,
+                       std::wstring& callText, int& threshold, int& delay,
+                       const std::wstring& dMuted,
+                       const std::wstring& dUnmuted,
                        const std::wstring& dCall) {
         warning = ReadIniBool(section, L"Warning", true);
         cue = ReadIniBool(section, L"AudioCue", true);
         toggle = ReadIniBool(section, L"Toggle", true);
         mutedText = ReadIniString(section, L"MutedText", dMuted.c_str());
+        unmutedText =
+            ReadIniString(section, L"UnmutedText", dUnmuted.c_str());
         callText = ReadIniString(section, L"CallText", dCall.c_str());
         threshold = ReadIniInt(section, L"Threshold", 8, 1, 100);
         delay = ReadIniInt(section, L"Delay", 500, 100, 3000);
     };
     loadApp(L"Slack", g_settings.slackWarning, g_settings.slackAudioCue,
             g_settings.slackToggle, g_settings.slackMutedText,
+            g_settings.slackUnmutedText,
             g_settings.slackCallText, g_settings.slackThreshold,
             g_settings.slackDelay, defaults.slackMutedText,
+            defaults.slackUnmutedText,
             defaults.slackCallText);
     loadApp(L"Teams", g_settings.teamsWarning, g_settings.teamsAudioCue,
             g_settings.teamsToggle, g_settings.teamsMutedText,
+            g_settings.teamsUnmutedText,
             g_settings.teamsCallText, g_settings.teamsThreshold,
             g_settings.teamsDelay, defaults.teamsMutedText,
+            defaults.teamsUnmutedText,
             defaults.teamsCallText);
     loadApp(L"Zoom", g_settings.zoomWarning, g_settings.zoomAudioCue,
             g_settings.zoomToggle, g_settings.zoomMutedText,
+            g_settings.zoomUnmutedText,
             g_settings.zoomCallText, g_settings.zoomThreshold,
             g_settings.zoomDelay, defaults.zoomMutedText,
+            defaults.zoomUnmutedText,
             defaults.zoomCallText);
+    loadApp(L"GoogleMeet", g_settings.meetWarning,
+            g_settings.meetAudioCue, g_settings.meetToggle,
+            g_settings.meetMutedText, g_settings.meetUnmutedText,
+            g_settings.meetCallText, g_settings.meetThreshold,
+            g_settings.meetDelay, defaults.meetMutedText,
+            defaults.meetUnmutedText, defaults.meetCallText);
     g_settings.zoomShortcutFallback = ReadIniBool(
         L"Zoom", L"ShortcutFallback", defaults.zoomShortcutFallback);
     g_settings.headsetMode =
@@ -478,27 +511,37 @@ static void SaveSettings() {
                  g_settings.installUpdatesAutomatically);
     auto saveApp = [&](PCWSTR section, bool warning, bool cue, bool toggle,
                        const std::wstring& mutedText,
+                       const std::wstring& unmutedText,
                        const std::wstring& callText, int threshold, int delay) {
         WriteIniBool(section, L"Warning", warning);
         WriteIniBool(section, L"AudioCue", cue);
         WriteIniBool(section, L"Toggle", toggle);
         WriteIniString(section, L"MutedText", mutedText);
+        WriteIniString(section, L"UnmutedText", unmutedText);
         WriteIniString(section, L"CallText", callText);
         WriteIniInt(section, L"Threshold", threshold);
         WriteIniInt(section, L"Delay", delay);
     };
     saveApp(L"Slack", g_settings.slackWarning, g_settings.slackAudioCue,
             g_settings.slackToggle, g_settings.slackMutedText,
+            g_settings.slackUnmutedText,
             g_settings.slackCallText, g_settings.slackThreshold,
             g_settings.slackDelay);
     saveApp(L"Teams", g_settings.teamsWarning, g_settings.teamsAudioCue,
             g_settings.teamsToggle, g_settings.teamsMutedText,
+            g_settings.teamsUnmutedText,
             g_settings.teamsCallText, g_settings.teamsThreshold,
             g_settings.teamsDelay);
     saveApp(L"Zoom", g_settings.zoomWarning, g_settings.zoomAudioCue,
             g_settings.zoomToggle, g_settings.zoomMutedText,
+            g_settings.zoomUnmutedText,
             g_settings.zoomCallText, g_settings.zoomThreshold,
             g_settings.zoomDelay);
+    saveApp(L"GoogleMeet", g_settings.meetWarning,
+            g_settings.meetAudioCue, g_settings.meetToggle,
+            g_settings.meetMutedText, g_settings.meetUnmutedText,
+            g_settings.meetCallText, g_settings.meetThreshold,
+            g_settings.meetDelay);
     WriteIniBool(L"Zoom", L"ShortcutFallback",
                  g_settings.zoomShortcutFallback);
     WriteIniString(L"Headset", L"Mode", g_settings.headsetMode);
@@ -725,6 +768,10 @@ static bool QueueCallToggles() {
         g_pendingZoomCommand.store(kCallToggle);
         queued = true;
     }
+    if (g_settings.meetToggle && g_meetActive.load()) {
+        g_pendingMeetCommand.store(kCallToggle);
+        queued = true;
+    }
     return queued;
 }
 
@@ -736,15 +783,19 @@ static void QueueCallMuteState(bool muted) {
         g_pendingTeamsCommand.store(command);
     if (g_zoomActive.load() && g_zoomMuted.load() != muted)
         g_pendingZoomCommand.store(command);
+    if (g_meetActive.load() && g_meetMuted.load() != muted)
+        g_pendingMeetCommand.store(command);
 }
 
 static int SelectedCall() {
     if (g_slackActive.load() && g_slackMuted.load()) return 0;
     if (g_teamsActive.load() && g_teamsMuted.load()) return 1;
     if (g_zoomActive.load() && g_zoomMuted.load()) return 2;
+    if (g_meetActive.load() && g_meetMuted.load()) return 3;
     if (g_slackActive.load()) return 0;
     if (g_teamsActive.load()) return 1;
     if (g_zoomActive.load()) return 2;
+    if (g_meetActive.load()) return 3;
     return -1;
 }
 
@@ -752,6 +803,7 @@ static HWND CallWindowForIndex(int selected) {
     return selected == 0   ? g_slackWindow.load()
            : selected == 1 ? g_teamsWindow.load()
            : selected == 2 ? g_zoomWindow.load()
+           : selected == 3 ? g_meetWindow.load()
                            : nullptr;
 }
 
@@ -843,6 +895,7 @@ static void PublishUnavailableAudio() {
     bool callChanged = g_slackWarning.exchange(false);
     callChanged = g_teamsWarning.exchange(false) || callChanged;
     callChanged = g_zoomWarning.exchange(false) || callChanged;
+    callChanged = g_meetWarning.exchange(false) || callChanged;
     micChanged = SetDeviceName(L"No microphone available") || micChanged;
     if (g_settings.headsetMode != L"off")
         UpdateWindowsHardwareSource(false, false, L"");
@@ -1021,7 +1074,7 @@ static DWORD WINAPI AudioThreadProc(void*) {
     return 0;
 }
 
-enum class CallApp { Slack, Teams, Zoom };
+enum class CallApp { Slack, Teams, Zoom, GoogleMeet };
 enum class CallState { NotInCall, Unknown, Unmuted, Muted };
 
 static std::wstring Lowercase(std::wstring text) {
@@ -1032,9 +1085,41 @@ static std::wstring Lowercase(std::wstring text) {
 }
 
 static PCWSTR CallName(CallApp app) {
-    return app == CallApp::Slack ? L"Slack"
-           : app == CallApp::Teams ? L"Microsoft Teams"
-                                   : L"Zoom";
+    switch (app) {
+        case CallApp::Slack:
+            return L"Slack";
+        case CallApp::Teams:
+            return L"Microsoft Teams";
+        case CallApp::Zoom:
+            return L"Zoom";
+        case CallApp::GoogleMeet:
+            return L"Google Meet";
+    }
+    return L"Call";
+}
+
+static bool IsMeetBrowserExecutable(PCWSTR file) {
+    return _wcsicmp(file, L"chrome.exe") == 0 ||
+           _wcsicmp(file, L"msedge.exe") == 0 ||
+           _wcsicmp(file, L"firefox.exe") == 0 ||
+           _wcsicmp(file, L"brave.exe") == 0 ||
+           _wcsicmp(file, L"vivaldi.exe") == 0 ||
+           _wcsicmp(file, L"opera.exe") == 0 ||
+           _wcsicmp(file, L"opera_gx.exe") == 0 ||
+           _wcsicmp(file, L"arc.exe") == 0;
+}
+
+static bool WindowTitleLooksLikeMeet(HWND window) {
+    int length = GetWindowTextLengthW(window);
+    if (length <= 0 || length > 4096) return false;
+    std::wstring title(static_cast<size_t>(length) + 1, L'\0');
+    int copied = GetWindowTextW(window, title.data(), length + 1);
+    if (copied <= 0) return false;
+    title.resize(static_cast<size_t>(copied));
+    title = Lowercase(std::move(title));
+    return title.find(L"google meet") != std::wstring::npos ||
+           title.starts_with(L"meet - ") ||
+           title.find(L" - meet - ") != std::wstring::npos;
 }
 
 static bool IsCallWindow(HWND window, CallApp app) {
@@ -1057,9 +1142,12 @@ static bool IsCallWindow(HWND window, CallApp app) {
         else if (app == CallApp::Teams)
             matches = _wcsicmp(file, L"ms-teams.exe") == 0 ||
                       _wcsicmp(file, L"teams.exe") == 0;
-        else
+        else if (app == CallApp::Zoom)
             matches = _wcsicmp(file, L"zoom.exe") == 0 ||
                       _wcsicmp(file, L"cpthost.exe") == 0;
+        else
+            matches = IsMeetBrowserExecutable(file) &&
+                      WindowTitleLooksLikeMeet(window);
     }
     CloseHandle(process);
     return matches;
@@ -1210,15 +1298,33 @@ static CallState ReadCallState(IUIAutomation* automation, CallApp app,
     if (FAILED(automation->CreatePropertyCondition(
             UIA_ControlTypePropertyId, type, condition.put())))
         return CallState::NotInCall;
-    const std::wstring* mutedSetting =
-        app == CallApp::Slack ? &g_settings.slackMutedText
-        : app == CallApp::Teams ? &g_settings.teamsMutedText
-                                : &g_settings.zoomMutedText;
-    const std::wstring* callSetting =
-        app == CallApp::Slack ? &g_settings.slackCallText
-        : app == CallApp::Teams ? &g_settings.teamsCallText
-                                : &g_settings.zoomCallText;
+    const std::wstring* mutedSetting = nullptr;
+    const std::wstring* unmutedSetting = nullptr;
+    const std::wstring* callSetting = nullptr;
+    switch (app) {
+        case CallApp::Slack:
+            mutedSetting = &g_settings.slackMutedText;
+            unmutedSetting = &g_settings.slackUnmutedText;
+            callSetting = &g_settings.slackCallText;
+            break;
+        case CallApp::Teams:
+            mutedSetting = &g_settings.teamsMutedText;
+            unmutedSetting = &g_settings.teamsUnmutedText;
+            callSetting = &g_settings.teamsCallText;
+            break;
+        case CallApp::Zoom:
+            mutedSetting = &g_settings.zoomMutedText;
+            unmutedSetting = &g_settings.zoomUnmutedText;
+            callSetting = &g_settings.zoomCallText;
+            break;
+        case CallApp::GoogleMeet:
+            mutedSetting = &g_settings.meetMutedText;
+            unmutedSetting = &g_settings.meetUnmutedText;
+            callSetting = &g_settings.meetCallText;
+            break;
+    }
     std::wstring mutedText = Lowercase(*mutedSetting);
+    std::wstring unmutedText = Lowercase(*unmutedSetting);
     std::wstring callText = Lowercase(*callSetting);
     for (HWND window : windows) {
         ComPtr<IUIAutomationElement> root;
@@ -1242,7 +1348,8 @@ static CallState ReadCallState(IUIAutomation* automation, CallApp app,
                 continue;
             BOOL offscreen = TRUE;
             if (FAILED(button->get_CurrentIsOffscreen(&offscreen)) ||
-                (offscreen && app != CallApp::Zoom))
+                (offscreen && app != CallApp::Zoom &&
+                 app != CallApp::GoogleMeet))
                 continue;
             BSTR raw = nullptr;
             if (FAILED(button->get_CurrentName(&raw)) || !raw) continue;
@@ -1252,7 +1359,7 @@ static CallState ReadCallState(IUIAutomation* automation, CallApp app,
             if (ContainsToken(name, mutedText)) {
                 hasUnmute = true;
                 unmuteButton.copy_from(button.get());
-            } else if (ContainsToken(name, L"mute")) {
+            } else if (ContainsToken(name, unmutedText)) {
                 hasMute = true;
                 muteButton.copy_from(button.get());
             }
@@ -1291,13 +1398,15 @@ static DWORD WINAPI CallThreadProc(void*) {
         CoUninitialize();
         return 0;
     }
-    ULONGLONG lastSlack = 0, lastTeams = 0, lastZoom = 0;
+    ULONGLONG lastSlack = 0, lastTeams = 0, lastZoom = 0, lastMeet = 0;
     ULONGLONG slackSpeaking = 0, slackUntil = 0;
     ULONGLONG teamsSpeaking = 0, teamsUntil = 0;
     ULONGLONG zoomSpeaking = 0, zoomUntil = 0;
+    ULONGLONG meetSpeaking = 0, meetUntil = 0;
     CallState slack = CallState::NotInCall;
     CallState teams = CallState::NotInCall;
     CallState zoom = CallState::NotInCall;
+    CallState meet = CallState::NotInCall;
     int deferredZoom = kCallNone;
     int deferredZoomAttempts = 0;
     bool headsetCalls = g_settings.headsetSyncCalls &&
@@ -1311,6 +1420,9 @@ static DWORD WINAPI CallThreadProc(void*) {
                         headsetCalls;
     bool monitorZoom = g_settings.showCallStateIcon ||
                        g_settings.zoomWarning || g_settings.zoomToggle ||
+                       headsetCalls;
+    bool monitorMeet = g_settings.showCallStateIcon ||
+                       g_settings.meetWarning || g_settings.meetToggle ||
                        headsetCalls;
 
     while (WaitForSingleObject(g_stopEvent, 50) == WAIT_TIMEOUT &&
@@ -1404,6 +1516,22 @@ static DWORD WINAPI CallThreadProc(void*) {
             g_zoomWindow.store(window);
             if (changed) NotifyMain(kStateMic | kStateCall);
         }
+        int meetCommand = g_pendingMeetCommand.exchange(kCallNone);
+        if (!lastMeet || now - lastMeet >= 1500 ||
+            meetCommand != kCallNone) {
+            HWND window = nullptr;
+            meet = monitorMeet
+                       ? ReadCallState(automation.get(), CallApp::GoogleMeet,
+                                       meetCommand, &window)
+                       : CallState::NotInCall;
+            lastMeet = now = GetTickCount64();
+            bool active = meet != CallState::NotInCall;
+            bool muted = meet == CallState::Muted;
+            bool changed = g_meetActive.exchange(active) != active;
+            changed = (g_meetMuted.exchange(muted) != muted) || changed;
+            g_meetWindow.store(window);
+            if (changed) NotifyMain(kStateMic | kStateCall);
+        }
 
         bool windowsCanHear = g_audioAvailable.load() &&
                               !g_audioMuted.load();
@@ -1440,6 +1568,9 @@ static DWORD WINAPI CallThreadProc(void*) {
         warning(zoom, g_settings.zoomWarning, g_settings.zoomAudioCue,
                 g_settings.zoomThreshold, g_settings.zoomDelay,
                 zoomSpeaking, zoomUntil, g_zoomWarning);
+        warning(meet, g_settings.meetWarning, g_settings.meetAudioCue,
+                g_settings.meetThreshold, g_settings.meetDelay,
+                meetSpeaking, meetUntil, g_meetWarning);
         if (cue) MessageBeep(MB_ICONEXCLAMATION);
         if (changed) NotifyMain(kStateCall);
     }
@@ -1456,6 +1587,10 @@ static DWORD WINAPI CallThreadProc(void*) {
     g_zoomKnown.store(false);
     g_zoomWarning.store(false);
     g_zoomWindow.store(nullptr);
+    g_meetActive.store(false);
+    g_meetMuted.store(false);
+    g_meetWarning.store(false);
+    g_meetWindow.store(nullptr);
     g_pendingFocusCall.store(-1);
     NotifyMain(kStateMic | kStateCall);
     automation.reset();
@@ -1708,6 +1843,7 @@ static std::optional<bool> CurrentCallMuteState() {
     if (selected == 0) return g_slackMuted.load();
     if (selected == 1) return g_teamsMuted.load();
     if (selected == 2 && g_zoomKnown.load()) return g_zoomMuted.load();
+    if (selected == 3) return g_meetMuted.load();
     return std::nullopt;
 }
 
@@ -2681,9 +2817,20 @@ static DWORD WINAPI SafeCallThreadProc(void*) noexcept {
     g_slackActive.store(false);
     g_teamsActive.store(false);
     g_zoomActive.store(false);
+    g_meetActive.store(false);
+    g_slackMuted.store(false);
+    g_teamsMuted.store(false);
+    g_zoomMuted.store(false);
+    g_zoomKnown.store(false);
+    g_meetMuted.store(false);
     g_slackWarning.store(false);
     g_teamsWarning.store(false);
     g_zoomWarning.store(false);
+    g_meetWarning.store(false);
+    g_slackWindow.store(nullptr);
+    g_teamsWindow.store(nullptr);
+    g_zoomWindow.store(nullptr);
+    g_meetWindow.store(nullptr);
     NotifyMain(kStateMic | kStateCall);
     return 0;
 }
@@ -2742,14 +2889,16 @@ static bool StartWorkers() {
     if (g_settings.showCallStateIcon || g_settings.slackWarning ||
         g_settings.slackToggle || g_settings.teamsWarning ||
         g_settings.teamsToggle || g_settings.zoomWarning ||
-        g_settings.zoomToggle || headsetCalls)
+        g_settings.zoomToggle || g_settings.meetWarning ||
+        g_settings.meetToggle || headsetCalls)
         g_callThread = CreateThread(nullptr, 0, SafeCallThreadProc, nullptr, 0,
                                     nullptr);
     if (!g_callThread &&
         (g_settings.showCallStateIcon || g_settings.slackWarning ||
          g_settings.slackToggle || g_settings.teamsWarning ||
          g_settings.teamsToggle || g_settings.zoomWarning ||
-         g_settings.zoomToggle || headsetCalls)) {
+         g_settings.zoomToggle || g_settings.meetWarning ||
+         g_settings.meetToggle || headsetCalls)) {
         Log(L"Call monitoring thread creation failed: %u", GetLastError());
     }
     if (g_settings.headsetMode != L"off")
@@ -2877,6 +3026,23 @@ static void DrawZoomLogo(Graphics& graphics) {
     graphics.FillPolygon(&white, points, ARRAYSIZE(points));
 }
 
+static void DrawMeetLogo(Graphics& graphics) {
+    SolidBrush green(Color(255, 0, 172, 84));
+    GraphicsPath body;
+    AddRoundedRect(body, RectF(7, 7, 15, 18), 2.5f);
+    graphics.FillPath(&green, &body);
+    PointF camera[] = {{22, 12}, {29, 8}, {29, 24}, {22, 20}};
+    graphics.FillPolygon(&green, camera, ARRAYSIZE(camera));
+    SolidBrush yellow(Color(255, 251, 188, 4));
+    PointF yellowPart[] = {{7, 7}, {14, 7}, {7, 14}};
+    graphics.FillPolygon(&yellow, yellowPart, ARRAYSIZE(yellowPart));
+    SolidBrush red(Color(255, 234, 67, 53));
+    PointF redPart[] = {{7, 18}, {14, 25}, {7, 25}};
+    graphics.FillPolygon(&red, redPart, ARRAYSIZE(redPart));
+    SolidBrush blue(Color(255, 66, 133, 244));
+    graphics.FillRectangle(&blue, 4, 12, 6, 8);
+}
+
 static HICON CreateCallIcon() {
     Bitmap bitmap(32, 32, PixelFormat32bppARGB);
     Graphics graphics(&bitmap);
@@ -2885,10 +3051,12 @@ static HICON CreateCallIcon() {
     int selected = SelectedCall();
     if (selected == 0) DrawSlackLogo(graphics);
     else if (selected == 1) DrawTeamsLogo(graphics);
-    else DrawZoomLogo(graphics);
+    else if (selected == 2) DrawZoomLogo(graphics);
+    else DrawMeetLogo(graphics);
     bool muted = selected == 0   ? g_slackMuted.load()
                  : selected == 1 ? g_teamsMuted.load()
-                                 : g_zoomMuted.load();
+                 : selected == 2 ? g_zoomMuted.load()
+                                 : g_meetMuted.load();
     bool known = selected != 2 || g_zoomKnown.load();
     if (muted) {
         Pen slash(Color(255, 239, 68, 68), 3.0f);
@@ -2905,7 +3073,8 @@ static HICON CreateCallIcon() {
     }
     int activeCount = static_cast<int>(g_slackActive.load()) +
                       static_cast<int>(g_teamsActive.load()) +
-                      static_cast<int>(g_zoomActive.load());
+                      static_cast<int>(g_zoomActive.load()) +
+                      static_cast<int>(g_meetActive.load());
     if (activeCount > 1) {
         SolidBrush dark(Color(240, 35, 35, 35));
         SolidBrush white(Color(255, 255, 255, 255));
@@ -2934,6 +3103,7 @@ static std::wstring CallList(bool withStates) {
     append(g_teamsActive.load(), true, g_teamsMuted.load(), L"Teams");
     append(g_zoomActive.load(), g_zoomKnown.load(), g_zoomMuted.load(),
            L"Zoom");
+    append(g_meetActive.load(), true, g_meetMuted.load(), L"Google Meet");
     return result;
 }
 
@@ -3067,6 +3237,10 @@ static void ShowWarningBalloon() {
     if (g_zoomWarning.load()) {
         if (!apps.empty()) apps += L", ";
         apps += L"Zoom";
+    }
+    if (g_meetWarning.load()) {
+        if (!apps.empty()) apps += L", ";
+        apps += L"Google Meet";
     }
     if (apps.empty()) return;
     g_updateBalloonActive.store(false);
@@ -3290,6 +3464,7 @@ enum ControlId {
     IDC_SLACK_CUE,
     IDC_SLACK_TOGGLE,
     IDC_SLACK_MUTED_TEXT,
+    IDC_SLACK_UNMUTED_TEXT,
     IDC_SLACK_CALL_TEXT,
     IDC_SLACK_THRESHOLD,
     IDC_SLACK_DELAY,
@@ -3297,6 +3472,7 @@ enum ControlId {
     IDC_TEAMS_CUE,
     IDC_TEAMS_TOGGLE,
     IDC_TEAMS_MUTED_TEXT,
+    IDC_TEAMS_UNMUTED_TEXT,
     IDC_TEAMS_CALL_TEXT,
     IDC_TEAMS_THRESHOLD,
     IDC_TEAMS_DELAY,
@@ -3304,25 +3480,34 @@ enum ControlId {
     IDC_ZOOM_CUE,
     IDC_ZOOM_TOGGLE,
     IDC_ZOOM_MUTED_TEXT,
+    IDC_ZOOM_UNMUTED_TEXT,
     IDC_ZOOM_CALL_TEXT,
     IDC_ZOOM_THRESHOLD,
     IDC_ZOOM_DELAY,
     IDC_ZOOM_SHORTCUT_FALLBACK,
-    IDC_HEADSET_MODE = 600,
+    IDC_MEET_WARNING = 600,
+    IDC_MEET_CUE,
+    IDC_MEET_TOGGLE,
+    IDC_MEET_MUTED_TEXT,
+    IDC_MEET_UNMUTED_TEXT,
+    IDC_MEET_CALL_TEXT,
+    IDC_MEET_THRESHOLD,
+    IDC_MEET_DELAY,
+    IDC_HEADSET_MODE = 700,
     IDC_HEADSET_WINDOWS,
     IDC_HEADSET_CALLS,
     IDC_HEADSET_INTERVAL,
     IDC_HEADSET_METHOD,
     IDC_HEADSET_CONFIDENCE,
     IDC_HEADSET_EXPORT,
-    IDC_UPDATES_AUTOMATIC = 700,
+    IDC_UPDATES_AUTOMATIC = 800,
     IDC_UPDATES_PRERELEASE,
     IDC_UPDATES_AUTOINSTALL,
     IDC_UPDATES_CHECK_NOW,
     IDC_UPDATES_STATUS,
     IDC_UPDATES_VIEW_RELEASE,
     IDC_UPDATES_INSTALL,
-    IDM_SETTINGS = 800,
+    IDM_SETTINGS = 900,
     IDM_TOGGLE_CALLS,
     IDM_VIEW_UPDATE,
     IDM_EXIT
@@ -3404,27 +3589,29 @@ static void CreateCallPage(HWND window, int page, PCWSTR appName, int base,
     std::wstring title = std::wstring(appName) + L" integration";
     AddLabel(window, title.c_str(), 32, 58, 300, page);
     AddCheck(window, L"Warn when speaking while the call is muted", base, 32,
-             94, 400, page);
+             88, 400, page);
     AddCheck(window, L"Play an audio cue when the warning begins", base + 1,
-             32, 128, 400, page);
+             32, 118, 400, page);
     AddCheck(window, L"Allow taskbar right-click mute/unmute", base + 2, 32,
-             162, 400, page);
-    AddLabel(window, L"Muted-button accessible text", 32, 210, 230, page);
-    AddEdit(window, base + 3, 270, 206, 270, page);
-    AddLabel(window, L"In-call marker text", 32, 254, 230, page);
-    AddEdit(window, base + 4, 270, 250, 270, page);
-    AddLabel(window, L"Speech threshold (1–100%)", 32, 298, 230, page);
-    AddEdit(window, base + 5, 270, 294, 90, page);
-    AddLabel(window, L"Speech delay (100–3000 ms)", 32, 342, 230, page);
-    AddEdit(window, base + 6, 270, 338, 90, page);
-    int noteY = 392;
-    int noteHeight = 44;
+             148, 400, page);
+    AddLabel(window, L"Muted-button accessible text", 32, 184, 230, page);
+    AddEdit(window, base + 3, 270, 180, 270, page);
+    AddLabel(window, L"Unmuted-button accessible text", 32, 220, 230, page);
+    AddEdit(window, base + 4, 270, 216, 270, page);
+    AddLabel(window, L"In-call marker text", 32, 256, 230, page);
+    AddEdit(window, base + 5, 270, 252, 270, page);
+    AddLabel(window, L"Speech threshold (1–100%)", 32, 292, 230, page);
+    AddEdit(window, base + 6, 270, 288, 90, page);
+    AddLabel(window, L"Speech delay (100–3000 ms)", 32, 328, 230, page);
+    AddEdit(window, base + 7, 270, 324, 90, page);
+    int noteY = 372;
+    int noteHeight = 64;
     if (base == IDC_ZOOM_WARNING) {
         AddCheck(window,
                  L"Allow Alt+A fallback when Zoom controls are hidden",
-                 IDC_ZOOM_SHORTCUT_FALLBACK, 32, 374, 450, page);
-        noteY = 410;
-        noteHeight = 30;
+                 IDC_ZOOM_SHORTCUT_FALLBACK, 32, 354, 450, page);
+        noteY = 386;
+        noteHeight = 50;
     }
     std::wstring note = L"Separate alternative labels with |. Default call "
                         L"marker: ";
@@ -3433,7 +3620,7 @@ static void CreateCallPage(HWND window, int page, PCWSTR appName, int base,
 }
 
 static void CreateHeadsetPage(HWND window) {
-    int page = 4;
+    int page = 5;
     AddLabel(window, L"Headset mute synchronization", 32, 58, 400, page);
     AddLabel(window, L"Detection method", 32, 88, 140, page);
     AddControl(window, L"STATIC", L"Unsupported/no observable state",
@@ -3455,7 +3642,8 @@ static void CreateHeadsetPage(HWND window) {
                  reinterpret_cast<LPARAM>(L"Disabled"));
     AddCheck(window, L"Synchronize Windows microphone", IDC_HEADSET_WINDOWS,
              32, 202, 360, page);
-    AddCheck(window, L"Synchronize active Slack, Teams, and Zoom calls",
+    AddCheck(window,
+             L"Synchronize active Slack, Teams, Zoom, and Meet calls",
              IDC_HEADSET_CALLS, 32, 234, 440, page);
     AddLabel(window, L"Status polling interval (200–2000 ms)", 32, 274, 250,
              page);
@@ -3470,7 +3658,7 @@ static void CreateHeadsetPage(HWND window) {
 }
 
 static void CreateUpdatesPage(HWND window) {
-    int page = 5;
+    int page = 6;
     AddLabel(window, L"MuteAlert updates", 32, 58, 400, page);
     std::wstring current = L"Current version: ";
     current += MUTEALERT_VERSION_WSTRING;
@@ -3743,28 +3931,37 @@ static void LoadSettingsControls(HWND window, const Settings& settings) {
     SetCheck(window, IDC_UPDATES_AUTOINSTALL,
              settings.installUpdatesAutomatically);
     auto setApp = [&](int base, bool warning, bool cue, bool toggle,
-                      const std::wstring& muted, const std::wstring& marker,
-                      int threshold, int delay) {
+                      const std::wstring& muted,
+                      const std::wstring& unmuted,
+                      const std::wstring& marker, int threshold, int delay) {
         SetCheck(window, base, warning);
         SetCheck(window, base + 1, cue);
         SetCheck(window, base + 2, toggle);
         SetDlgItemTextW(window, base + 3, muted.c_str());
-        SetDlgItemTextW(window, base + 4, marker.c_str());
-        SetEdit(window, base + 5, threshold);
-        SetEdit(window, base + 6, delay);
+        SetDlgItemTextW(window, base + 4, unmuted.c_str());
+        SetDlgItemTextW(window, base + 5, marker.c_str());
+        SetEdit(window, base + 6, threshold);
+        SetEdit(window, base + 7, delay);
     };
     setApp(IDC_SLACK_WARNING, settings.slackWarning, settings.slackAudioCue,
            settings.slackToggle, settings.slackMutedText,
+           settings.slackUnmutedText,
            settings.slackCallText, settings.slackThreshold,
            settings.slackDelay);
     setApp(IDC_TEAMS_WARNING, settings.teamsWarning, settings.teamsAudioCue,
            settings.teamsToggle, settings.teamsMutedText,
+           settings.teamsUnmutedText,
            settings.teamsCallText, settings.teamsThreshold,
            settings.teamsDelay);
     setApp(IDC_ZOOM_WARNING, settings.zoomWarning, settings.zoomAudioCue,
            settings.zoomToggle, settings.zoomMutedText,
+           settings.zoomUnmutedText,
            settings.zoomCallText, settings.zoomThreshold,
            settings.zoomDelay);
+    setApp(IDC_MEET_WARNING, settings.meetWarning, settings.meetAudioCue,
+           settings.meetToggle, settings.meetMutedText,
+           settings.meetUnmutedText, settings.meetCallText,
+           settings.meetThreshold, settings.meetDelay);
     SetCheck(window, IDC_ZOOM_SHORTCUT_FALLBACK,
              settings.zoomShortcutFallback);
     int mode = settings.headsetMode == L"muteOnly" ? 1
@@ -3820,30 +4017,41 @@ static Settings ReadSettingsControls(HWND window) {
         IsDlgButtonChecked(window, IDC_UPDATES_AUTOINSTALL) == BST_CHECKED;
     if (settings.installUpdatesAutomatically) settings.checkForUpdates = true;
     auto readApp = [&](int base, bool& warning, bool& cue, bool& toggle,
-                       std::wstring& muted, std::wstring& marker,
-                       int& threshold, int& delay, PCWSTR defaultMuted,
+                       std::wstring& muted, std::wstring& unmuted,
+                       std::wstring& marker, int& threshold, int& delay,
+                       PCWSTR defaultMuted, PCWSTR defaultUnmuted,
                        PCWSTR defaultMarker) {
         warning = IsDlgButtonChecked(window, base) == BST_CHECKED;
         cue = IsDlgButtonChecked(window, base + 1) == BST_CHECKED;
         toggle = IsDlgButtonChecked(window, base + 2) == BST_CHECKED;
         muted = GetEditText(window, base + 3, defaultMuted);
-        marker = GetEditText(window, base + 4, defaultMarker);
-        threshold = GetEditInt(window, base + 5, 8, 1, 100);
-        delay = GetEditInt(window, base + 6, 500, 100, 3000);
+        unmuted = GetEditText(window, base + 4, defaultUnmuted);
+        marker = GetEditText(window, base + 5, defaultMarker);
+        threshold = GetEditInt(window, base + 6, 8, 1, 100);
+        delay = GetEditInt(window, base + 7, 500, 100, 3000);
     };
     readApp(IDC_SLACK_WARNING, settings.slackWarning,
             settings.slackAudioCue, settings.slackToggle,
-            settings.slackMutedText, settings.slackCallText,
-            settings.slackThreshold, settings.slackDelay, L"unmute", L"leave");
+            settings.slackMutedText, settings.slackUnmutedText,
+            settings.slackCallText, settings.slackThreshold,
+            settings.slackDelay, L"unmute", L"mute", L"leave");
     readApp(IDC_TEAMS_WARNING, settings.teamsWarning,
             settings.teamsAudioCue, settings.teamsToggle,
-            settings.teamsMutedText, settings.teamsCallText,
+            settings.teamsMutedText, settings.teamsUnmutedText,
+            settings.teamsCallText,
             settings.teamsThreshold, settings.teamsDelay, L"unmute",
-            L"hang up|leave");
+            L"mute", L"hang up|leave");
     readApp(IDC_ZOOM_WARNING, settings.zoomWarning, settings.zoomAudioCue,
             settings.zoomToggle, settings.zoomMutedText,
-            settings.zoomCallText, settings.zoomThreshold,
-            settings.zoomDelay, L"unmute", L"leave|end");
+            settings.zoomUnmutedText, settings.zoomCallText,
+            settings.zoomThreshold, settings.zoomDelay, L"unmute", L"mute",
+            L"leave|end");
+    readApp(IDC_MEET_WARNING, settings.meetWarning,
+            settings.meetAudioCue, settings.meetToggle,
+            settings.meetMutedText, settings.meetUnmutedText,
+            settings.meetCallText, settings.meetThreshold,
+            settings.meetDelay, L"turn on microphone",
+            L"turn off microphone", L"leave call");
     settings.zoomShortcutFallback =
         IsDlgButtonChecked(window, IDC_ZOOM_SHORTCUT_FALLBACK) ==
         BST_CHECKED;
@@ -3870,7 +4078,7 @@ static LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message,
             HWND tab = AddControl(window, WC_TABCONTROLW, L"",
                                   WS_TABSTOP, 12, 12, 576, 450, IDC_TAB, -1);
             for (PCWSTR name : {L"General", L"Slack", L"Teams", L"Zoom",
-                                L"Headset", L"Updates"}) {
+                                L"Meet", L"Headset", L"Updates"}) {
                 TCITEMW item{};
                 item.mask = TCIF_TEXT;
                 item.pszText = const_cast<PWSTR>(name);
@@ -3882,6 +4090,8 @@ static LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message,
                            L"hang up|leave");
             CreateCallPage(window, 3, L"Zoom", IDC_ZOOM_WARNING,
                            L"leave|end");
+            CreateCallPage(window, 4, L"Google Meet", IDC_MEET_WARNING,
+                           L"leave call");
             CreateHeadsetPage(window);
             CreateUpdatesPage(window);
             AddControl(window, L"BUTTON", L"Restore defaults", WS_TABSTOP,
@@ -4154,7 +4364,8 @@ static LRESULT CALLBACK MainWindowProc(HWND window, UINT message,
             if (callChanged) {
                 bool warning = g_slackWarning.load() ||
                                g_teamsWarning.load() ||
-                               g_zoomWarning.load();
+                               g_zoomWarning.load() ||
+                               g_meetWarning.load();
                 if (warning && !g_previousWarning) ShowWarningBalloon();
                 g_previousWarning = warning;
             }
