@@ -72,6 +72,20 @@ accessible Windows UI labels. Localized or changed labels can be adjusted from
 Settings. Google Meet currently requires the meeting tab to be the active tab
 in Chrome, Edge, Firefox, Brave, Vivaldi, Opera, or Arc so that its controls
 are exposed to Windows UI Automation.
+
+Enable **Google Meet integration** on the Meet settings page, then select a
+warning, right-click control, call badge, or headset call synchronization.
+Meet monitoring is opt-in, including when the shared call badge is enabled.
+The audio cue also requires the Meet warning. Title fragments and exact browser
+executable filenames can be customized; empty filters restore the defaults.
+Only browsers with an active microphone capture session are scanned, including
+verified same-executable ancestors of audio-service child processes. Process
+snapshots are collected only when active browser capture is found. Browser
+accessibility may increase CPU/memory usage until the browser exits.
+Live Meet call testing, including capture behavior while muted and Firefox
+compatibility, remains outstanding. Detection clears if capture stops or the
+meeting controls become inaccessible.
+
 Zoom's hidden-toolbar fallback is disabled by default because it temporarily
 activates Zoom and sends its default `Alt+A` mute shortcut. Enable it on the
 Zoom Settings page only if that shortcut has not been customized.

@@ -19,6 +19,7 @@
 #include <windowsx.h>
 #include <commctrl.h>
 #include <endpointvolume.h>
+#include <audiopolicy.h>
 #include <propkey.h>
 #include <functiondiscoverykeys_devpkey.h>
 #include <gdiplus.h>
@@ -194,6 +195,11 @@ struct Settings {
     int zoomThreshold = 8;
     int zoomDelay = 500;
 
+    bool meetEnabled = false;
+    std::wstring meetWindowTitle = L"meet -|meet \u2013|meet \u2014";
+    std::wstring meetBrowserExecutables =
+        L"chrome.exe|msedge.exe|firefox.exe|brave.exe|vivaldi.exe|opera.exe|arc.exe";
+    std::vector<std::wstring> meetBrowserNames;
     bool meetWarning = true;
     bool meetAudioCue = true;
     bool meetToggle = true;
@@ -205,6 +211,35 @@ struct Settings {
 };
 
 static Settings g_settings;
+
+static bool MeetMonitoringEnabled() {
+    bool syncCalls = g_settings.headsetSyncCalls &&
+        (g_settings.headsetMode == L"full" || g_settings.headsetMode == L"muteOnly");
+    return g_settings.meetEnabled &&
+        (g_settings.showCallStateIcon || g_settings.meetWarning ||
+         g_settings.meetToggle || syncCalls);
+}
+
+static void PrepareMeetSettings() {
+    if (g_settings.meetWindowTitle.find_first_not_of(L" |\t\r\n") ==
+        std::wstring::npos)
+        g_settings.meetWindowTitle = Settings{}.meetWindowTitle;
+    if (g_settings.meetBrowserExecutables.find_first_not_of(L" |\t\r\n") ==
+        std::wstring::npos)
+        g_settings.meetBrowserExecutables = Settings{}.meetBrowserExecutables;
+    g_settings.meetBrowserNames.clear();
+    std::wistringstream tokens(g_settings.meetBrowserExecutables);
+    std::wstring token;
+    while (std::getline(tokens, token, L'|')) {
+        size_t first = token.find_first_not_of(L" \t\r\n");
+        size_t last = token.find_last_not_of(L" \t\r\n");
+        if (first == std::wstring::npos) continue;
+        token = token.substr(first, last - first + 1);
+        std::transform(token.begin(), token.end(), token.begin(),
+                       [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+        g_settings.meetBrowserNames.push_back(std::move(token));
+    }
+}
 static std::wstring g_settingsPath;
 static HINSTANCE g_instance;
 static HWND g_mainWindow;
@@ -453,6 +488,12 @@ static void LoadSettings() {
             g_settings.zoomDelay, defaults.zoomMutedText,
             defaults.zoomUnmutedText,
             defaults.zoomCallText);
+    g_settings.meetEnabled = ReadIniBool(L"GoogleMeet", L"Enabled", false);
+    g_settings.meetWindowTitle = ReadIniString(
+        L"GoogleMeet", L"WindowTitle", defaults.meetWindowTitle.c_str());
+    g_settings.meetBrowserExecutables = ReadIniString(
+        L"GoogleMeet", L"BrowserExecutables", defaults.meetBrowserExecutables.c_str());
+    PrepareMeetSettings();
     loadApp(L"GoogleMeet", g_settings.meetWarning,
             g_settings.meetAudioCue, g_settings.meetToggle,
             g_settings.meetMutedText, g_settings.meetUnmutedText,
@@ -537,6 +578,9 @@ static void SaveSettings() {
             g_settings.zoomUnmutedText,
             g_settings.zoomCallText, g_settings.zoomThreshold,
             g_settings.zoomDelay);
+    WriteIniBool(L"GoogleMeet", L"Enabled", g_settings.meetEnabled);
+    WriteIniString(L"GoogleMeet", L"WindowTitle", g_settings.meetWindowTitle);
+    WriteIniString(L"GoogleMeet", L"BrowserExecutables", g_settings.meetBrowserExecutables);
     saveApp(L"GoogleMeet", g_settings.meetWarning,
             g_settings.meetAudioCue, g_settings.meetToggle,
             g_settings.meetMutedText, g_settings.meetUnmutedText,
@@ -1098,16 +1142,15 @@ static PCWSTR CallName(CallApp app) {
     return L"Call";
 }
 
+static bool ContainsToken(const std::wstring& name, const std::wstring& configured);
+
 static bool IsMeetBrowserExecutable(PCWSTR file) {
-    return _wcsicmp(file, L"chrome.exe") == 0 ||
-           _wcsicmp(file, L"msedge.exe") == 0 ||
-           _wcsicmp(file, L"firefox.exe") == 0 ||
-           _wcsicmp(file, L"brave.exe") == 0 ||
-           _wcsicmp(file, L"vivaldi.exe") == 0 ||
-           _wcsicmp(file, L"opera.exe") == 0 ||
-           _wcsicmp(file, L"opera_gx.exe") == 0 ||
-           _wcsicmp(file, L"arc.exe") == 0;
+    return std::find(g_settings.meetBrowserNames.begin(),
+                     g_settings.meetBrowserNames.end(), Lowercase(file)) !=
+           g_settings.meetBrowserNames.end();
 }
+
+static std::vector<DWORD> g_meetCaptureProcesses;
 
 static bool WindowTitleLooksLikeMeet(HWND window) {
     int length = GetWindowTextLengthW(window);
@@ -1117,9 +1160,7 @@ static bool WindowTitleLooksLikeMeet(HWND window) {
     if (copied <= 0) return false;
     title.resize(static_cast<size_t>(copied));
     title = Lowercase(std::move(title));
-    return title.find(L"google meet") != std::wstring::npos ||
-           title.starts_with(L"meet - ") ||
-           title.find(L" - meet - ") != std::wstring::npos;
+    return ContainsToken(title, Lowercase(g_settings.meetWindowTitle));
 }
 
 static bool IsCallWindow(HWND window, CallApp app) {
@@ -1146,7 +1187,10 @@ static bool IsCallWindow(HWND window, CallApp app) {
             matches = _wcsicmp(file, L"zoom.exe") == 0 ||
                       _wcsicmp(file, L"cpthost.exe") == 0;
         else
-            matches = IsMeetBrowserExecutable(file) &&
+            matches = MeetMonitoringEnabled() && IsMeetBrowserExecutable(file) &&
+                      std::find(g_meetCaptureProcesses.begin(),
+                                g_meetCaptureProcesses.end(), processId) !=
+                          g_meetCaptureProcesses.end() &&
                       WindowTitleLooksLikeMeet(window);
     }
     CloseHandle(process);
@@ -1348,8 +1392,7 @@ static CallState ReadCallState(IUIAutomation* automation, CallApp app,
                 continue;
             BOOL offscreen = TRUE;
             if (FAILED(button->get_CurrentIsOffscreen(&offscreen)) ||
-                (offscreen && app != CallApp::Zoom &&
-                 app != CallApp::GoogleMeet))
+                (offscreen && app != CallApp::Zoom))
                 continue;
             BSTR raw = nullptr;
             if (FAILED(button->get_CurrentName(&raw)) || !raw) continue;
@@ -1389,6 +1432,87 @@ static CallState ReadCallState(IUIAutomation* automation, CallApp app,
     return CallState::NotInCall;
 }
 
+static void RefreshMeetCaptureProcesses(IMMDeviceEnumerator* enumerator) {
+    g_meetCaptureProcesses.clear();
+    if (!enumerator) return;
+    std::unordered_map<DWORD, DWORD> parents;
+    bool parentsLoaded = false;
+    auto imagePath = [](DWORD pid) {
+        std::wstring result;
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (process) {
+            std::vector<wchar_t> buffer(32768);
+            DWORD length = static_cast<DWORD>(buffer.size());
+            if (QueryFullProcessImageNameW(process, 0, buffer.data(), &length))
+                result = Lowercase(std::wstring(buffer.data(), length));
+            CloseHandle(process);
+        }
+        return result;
+    };
+    for (ERole role : {eConsole, eCommunications, eMultimedia}) {
+        if (g_exiting.load()) break;
+        ComPtr<IMMDevice> device;
+        ComPtr<IAudioSessionManager2> manager;
+        ComPtr<IAudioSessionEnumerator> sessions;
+        if (FAILED(enumerator->GetDefaultAudioEndpoint(eCapture, role, device.put())) ||
+            FAILED(device->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL,
+                                    nullptr, manager.put_void())) ||
+            FAILED(manager->GetSessionEnumerator(sessions.put()))) continue;
+        int count = 0;
+        if (FAILED(sessions->GetCount(&count))) continue;
+        for (int i = 0; i < count && !g_exiting.load(); ++i) {
+            ComPtr<IAudioSessionControl> control;
+            ComPtr<IAudioSessionControl2> control2;
+            AudioSessionState state = AudioSessionStateExpired;
+            DWORD pid = 0;
+            if (FAILED(sessions->GetSession(i, control.put())) ||
+                FAILED(control->GetState(&state)) || state != AudioSessionStateActive ||
+                FAILED(control->QueryInterface(__uuidof(IAudioSessionControl2),
+                                               control2.put_void())) ||
+                FAILED(control2->GetProcessId(&pid)) || !pid) continue;
+            const std::wstring path = imagePath(pid);
+            if (path.empty() || !IsMeetBrowserExecutable(PathFindFileNameW(path.c_str())))
+                continue;
+            // Snapshot only after a browser with active capture is found, once
+            // per refresh. Chromium can record in a child audio-service process.
+            if (!parentsLoaded) {
+                parentsLoaded = true;
+                HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+                if (snapshot != INVALID_HANDLE_VALUE) {
+                    PROCESSENTRY32W entry{};
+                    entry.dwSize = sizeof(entry);
+                    if (Process32FirstW(snapshot, &entry)) {
+                        do {
+                            parents.emplace(entry.th32ProcessID, entry.th32ParentProcessID);
+                        } while (!g_exiting.load() && Process32NextW(snapshot, &entry));
+                    }
+                    CloseHandle(snapshot);
+                }
+            }
+            for (int depth = 0; pid && depth < 32; ++depth) {
+                if (std::find(g_meetCaptureProcesses.begin(), g_meetCaptureProcesses.end(),
+                              pid) != g_meetCaptureProcesses.end()) break;
+                g_meetCaptureProcesses.push_back(pid);
+                auto parent = parents.find(pid);
+                if (parent == parents.end() || parent->second == pid ||
+                    imagePath(parent->second) != path) break;
+                HANDLE child = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+                HANDLE ancestor = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                                              parent->second);
+                FILETIME childCreated{}, parentCreated{}, exit{}, kernel{}, user{};
+                bool valid = child && ancestor &&
+                    GetProcessTimes(child, &childCreated, &exit, &kernel, &user) &&
+                    GetProcessTimes(ancestor, &parentCreated, &exit, &kernel, &user) &&
+                    CompareFileTime(&parentCreated, &childCreated) <= 0;
+                if (child) CloseHandle(child);
+                if (ancestor) CloseHandle(ancestor);
+                if (!valid) break;
+                pid = parent->second;
+            }
+        }
+    }
+}
+
 static DWORD WINAPI CallThreadProc(void*) {
     if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return 0;
     ComPtr<IUIAutomation> automation;
@@ -1421,9 +1545,13 @@ static DWORD WINAPI CallThreadProc(void*) {
     bool monitorZoom = g_settings.showCallStateIcon ||
                        g_settings.zoomWarning || g_settings.zoomToggle ||
                        headsetCalls;
-    bool monitorMeet = g_settings.showCallStateIcon ||
-                       g_settings.meetWarning || g_settings.meetToggle ||
-                       headsetCalls;
+    bool monitorMeet = MeetMonitoringEnabled();
+    ComPtr<IMMDeviceEnumerator> meetEnumerator;
+    if (monitorMeet)
+        CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                         __uuidof(IMMDeviceEnumerator), meetEnumerator.put_void());
+    ULONGLONG lastMeetCapture = 0;
+    g_meetCaptureProcesses.clear();
 
     while (WaitForSingleObject(g_stopEvent, 50) == WAIT_TIMEOUT &&
            !g_exiting.load()) {
@@ -1516,11 +1644,15 @@ static DWORD WINAPI CallThreadProc(void*) {
             g_zoomWindow.store(window);
             if (changed) NotifyMain(kStateMic | kStateCall);
         }
+        if (monitorMeet && (!lastMeetCapture || now - lastMeetCapture >= 2000)) {
+            RefreshMeetCaptureProcesses(meetEnumerator.get());
+            lastMeetCapture = now = GetTickCount64();
+        }
         int meetCommand = g_pendingMeetCommand.exchange(kCallNone);
         if (!lastMeet || now - lastMeet >= 1500 ||
             meetCommand != kCallNone) {
             HWND window = nullptr;
-            meet = monitorMeet
+            meet = monitorMeet && !g_meetCaptureProcesses.empty()
                        ? ReadCallState(automation.get(), CallApp::GoogleMeet,
                                        meetCommand, &window)
                        : CallState::NotInCall;
@@ -1593,6 +1725,8 @@ static DWORD WINAPI CallThreadProc(void*) {
     g_meetWindow.store(nullptr);
     g_pendingFocusCall.store(-1);
     NotifyMain(kStateMic | kStateCall);
+    g_meetCaptureProcesses.clear();
+    meetEnumerator.reset();
     automation.reset();
     CoUninitialize();
     return 0;
@@ -2862,6 +2996,14 @@ static DWORD WINAPI SafeUpdateThreadProc(void*) noexcept {
 }
 
 static bool StartWorkers() {
+    PrepareMeetSettings();
+    if (!g_settings.meetEnabled &&
+        (g_settings.meetWarning || g_settings.meetToggle || g_settings.meetAudioCue))
+        Log(L"Google Meet features require Enable Google Meet integration; monitoring is off.");
+    if (g_settings.meetEnabled && !MeetMonitoringEnabled())
+        Log(L"Google Meet enabled without a consuming feature; monitoring is off.");
+    if (g_settings.meetEnabled && g_settings.meetAudioCue && !g_settings.meetWarning)
+        Log(L"Google Meet audio cue requires the speaking-while-muted warning.");
     g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_wakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_updateWakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -2889,16 +3031,14 @@ static bool StartWorkers() {
     if (g_settings.showCallStateIcon || g_settings.slackWarning ||
         g_settings.slackToggle || g_settings.teamsWarning ||
         g_settings.teamsToggle || g_settings.zoomWarning ||
-        g_settings.zoomToggle || g_settings.meetWarning ||
-        g_settings.meetToggle || headsetCalls)
+        g_settings.zoomToggle || MeetMonitoringEnabled() || headsetCalls)
         g_callThread = CreateThread(nullptr, 0, SafeCallThreadProc, nullptr, 0,
                                     nullptr);
     if (!g_callThread &&
         (g_settings.showCallStateIcon || g_settings.slackWarning ||
          g_settings.slackToggle || g_settings.teamsWarning ||
          g_settings.teamsToggle || g_settings.zoomWarning ||
-         g_settings.zoomToggle || g_settings.meetWarning ||
-         g_settings.meetToggle || headsetCalls)) {
+         g_settings.zoomToggle || MeetMonitoringEnabled() || headsetCalls)) {
         Log(L"Call monitoring thread creation failed: %u", GetLastError());
     }
     if (g_settings.headsetMode != L"off")
@@ -3493,6 +3633,9 @@ enum ControlId {
     IDC_MEET_CALL_TEXT,
     IDC_MEET_THRESHOLD,
     IDC_MEET_DELAY,
+    IDC_MEET_ENABLED,
+    IDC_MEET_TITLE,
+    IDC_MEET_BROWSERS,
     IDC_HEADSET_MODE = 700,
     IDC_HEADSET_WINDOWS,
     IDC_HEADSET_CALLS,
@@ -3617,6 +3760,34 @@ static void CreateCallPage(HWND window, int page, PCWSTR appName, int base,
                         L"marker: ";
     note += markerExample;
     AddNote(window, note.c_str(), 32, noteY, 510, noteHeight, page);
+}
+
+static void CreateMeetPage(HWND window) {
+    constexpr int page = 4;
+    AddCheck(window, L"Enable Google Meet integration (required below)",
+             IDC_MEET_ENABLED, 32, 54, 510, page);
+    AddCheck(window, L"Warn when speaking while Meet is muted",
+             IDC_MEET_WARNING, 32, 82, 510, page);
+    AddCheck(window, L"Play audio cue (requires warning above)",
+             IDC_MEET_CUE, 32, 110, 510, page);
+    AddCheck(window, L"Allow taskbar right-click mute/unmute",
+             IDC_MEET_TOGGLE, 32, 138, 510, page);
+    auto field = [&](PCWSTR label, int id, int y, int width) {
+        AddLabel(window, label, 32, y + 4, 230, page);
+        AddEdit(window, id, 270, y, width, page);
+    };
+    field(L"Browser window title fragments", IDC_MEET_TITLE, 174, 270);
+    field(L"Browser executable filenames", IDC_MEET_BROWSERS, 206, 270);
+    field(L"Muted-button accessible text", IDC_MEET_MUTED_TEXT, 238, 270);
+    field(L"Unmuted-button accessible text", IDC_MEET_UNMUTED_TEXT, 270, 270);
+    field(L"In-call marker text", IDC_MEET_CALL_TEXT, 302, 270);
+    field(L"Speech threshold (1-100%)", IDC_MEET_THRESHOLD, 334, 90);
+    field(L"Speech delay (100-3000 ms)", IDC_MEET_DELAY, 366, 90);
+    AddNote(window,
+            L"Keep the Meet tab selected and visible. Separate labels with |. "
+            L"Enable a feature above, the call icon, or headset call sync. "
+            L"Browser accessibility may increase CPU/memory use until browser exit.",
+            32, 402, 520, 50, page);
 }
 
 static void CreateHeadsetPage(HWND window) {
@@ -3962,6 +4133,9 @@ static void LoadSettingsControls(HWND window, const Settings& settings) {
            settings.meetToggle, settings.meetMutedText,
            settings.meetUnmutedText, settings.meetCallText,
            settings.meetThreshold, settings.meetDelay);
+    SetCheck(window, IDC_MEET_ENABLED, settings.meetEnabled);
+    SetDlgItemTextW(window, IDC_MEET_TITLE, settings.meetWindowTitle.c_str());
+    SetDlgItemTextW(window, IDC_MEET_BROWSERS, settings.meetBrowserExecutables.c_str());
     SetCheck(window, IDC_ZOOM_SHORTCUT_FALLBACK,
              settings.zoomShortcutFallback);
     int mode = settings.headsetMode == L"muteOnly" ? 1
@@ -4052,6 +4226,11 @@ static Settings ReadSettingsControls(HWND window) {
             settings.meetCallText, settings.meetThreshold,
             settings.meetDelay, L"turn on microphone",
             L"turn off microphone", L"leave call");
+    settings.meetEnabled = IsDlgButtonChecked(window, IDC_MEET_ENABLED) == BST_CHECKED;
+    settings.meetWindowTitle = GetEditText(window, IDC_MEET_TITLE,
+                                         Settings{}.meetWindowTitle.c_str());
+    settings.meetBrowserExecutables = GetEditText(window, IDC_MEET_BROWSERS,
+                                         Settings{}.meetBrowserExecutables.c_str());
     settings.zoomShortcutFallback =
         IsDlgButtonChecked(window, IDC_ZOOM_SHORTCUT_FALLBACK) ==
         BST_CHECKED;
@@ -4090,8 +4269,7 @@ static LRESULT CALLBACK SettingsWindowProc(HWND window, UINT message,
                            L"hang up|leave");
             CreateCallPage(window, 3, L"Zoom", IDC_ZOOM_WARNING,
                            L"leave|end");
-            CreateCallPage(window, 4, L"Google Meet", IDC_MEET_WARNING,
-                           L"leave call");
+            CreateMeetPage(window);
             CreateHeadsetPage(window);
             CreateUpdatesPage(window);
             AddControl(window, L"BUTTON", L"Restore defaults", WS_TABSTOP,
