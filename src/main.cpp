@@ -2285,8 +2285,8 @@ static DWORD WINAPI HeadsetThreadProc(void*) {
             if (g_settings.headsetSyncWindows && !g_audioMuted.load())
                 QueueWindowsMute(true);
             if (g_settings.headsetSyncCalls) QueueCallMuteState(true);
-        } else if (!observation.muted && syncUnmute && known &&
-                   previousMuted) {
+        } else if (!observation.muted && syncUnmute &&
+                   (!known || previousMuted)) {
             if (g_settings.headsetSyncWindows) QueueWindowsMute(false);
             if (g_settings.headsetSyncCalls) QueueCallMuteState(false);
         }
