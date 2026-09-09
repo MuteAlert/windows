@@ -278,6 +278,9 @@ static std::atomic<int> g_pendingTeamsCommand{-1};
 static std::atomic<int> g_pendingZoomCommand{-1};
 static std::atomic<int> g_pendingMeetCommand{-1};
 static std::atomic<int> g_pendingFocusCall{-1};
+// Worker restarts caused by saving settings must not re-arm a startup unmute.
+static std::atomic<bool> g_vendorInitialSyncPending{true};
+static std::atomic<bool> g_hardwareInitialSyncPending{true};
 static std::atomic<bool> g_checkForUpdates{true};
 static std::atomic<bool> g_includePrereleaseUpdates{true};
 static std::atomic<bool> g_manualUpdateCheck{false};
@@ -1090,6 +1093,7 @@ static DWORD WINAPI AudioThreadProc(void*) {
         if (endpoint.hardwareMute) {
             bool changed = observedMuteKnown &&
                            observedMuted != mutedNow;
+            bool initialSync = g_hardwareInitialSyncPending.exchange(false);
             bool selfGenerated = false;
             if (softwareMuteTarget && *softwareMuteTarget == mutedNow) {
                 selfGenerated = changed;
@@ -1100,8 +1104,8 @@ static DWORD WINAPI AudioThreadProc(void*) {
             bool syncUnmute = g_settings.headsetMode == L"full";
             if (g_settings.headsetSyncCalls &&
                 !selfGenerated &&
-                ((mutedNow && changed && syncMute) ||
-                 (!mutedNow && changed && syncUnmute))) {
+                ((mutedNow && (changed || initialSync) && syncMute) ||
+                 (!mutedNow && (changed || initialSync) && syncUnmute))) {
                 QueueCallMuteState(mutedNow);
                 RecordDiagnosticEvent(
                     std::wstring(L"Windows hardware mute changed to ") +
@@ -2270,6 +2274,7 @@ static DWORD WINAPI HeadsetThreadProc(void*) {
                 break;
             continue;
         }
+        bool initialSync = g_vendorInitialSyncPending.exchange(false);
         bool stateChanged = !known || observation.muted != previousMuted;
         UpdateSteelSeriesSource(true, observation.muted,
                                 observation.deviceName, observation.detail);
@@ -2286,8 +2291,10 @@ static DWORD WINAPI HeadsetThreadProc(void*) {
                 QueueWindowsMute(true);
             if (g_settings.headsetSyncCalls) QueueCallMuteState(true);
         } else if (!observation.muted && syncUnmute &&
-                   (!known || previousMuted)) {
-            if (g_settings.headsetSyncWindows) QueueWindowsMute(false);
+                   (initialSync || (known && previousMuted))) {
+            if (g_settings.headsetSyncWindows &&
+                (initialSync || g_audioMuted.load()))
+                QueueWindowsMute(false);
             if (g_settings.headsetSyncCalls) QueueCallMuteState(false);
         }
         known = true;
