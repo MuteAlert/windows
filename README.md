@@ -23,6 +23,9 @@ microphone widget without Windhawk or Explorer injection.
   adapters.
 - SteelSeries Arctis Nova Pro Wireless support retained as the first
   high-confidence vendor adapter.
+- Headset synchronization preserves manual Windows privacy mutes and only
+  releases a Windows mute that MuteAlert applied to the same input during the
+  current boot session.
 - Headset detection method and confidence shown in Settings, with a sanitized
   diagnostics export for adding more devices without exposing serial numbers,
   device paths, or raw HID values.
