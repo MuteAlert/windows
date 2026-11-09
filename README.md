@@ -23,9 +23,9 @@ microphone widget without Windhawk or Explorer injection.
   adapters.
 - SteelSeries Arctis Nova Pro Wireless support retained as the first
   high-confidence vendor adapter.
-- Headset synchronization preserves manual Windows privacy mutes and only
-  releases a Windows mute that MuteAlert applied to the same input during the
-  current boot session.
+- In full synchronization mode, an observable vendor headset switch is the
+  source of truth for the configured Windows input. Use mute-only or
+  status-only mode when Windows privacy mutes must remain independent.
 - Headset detection method and confidence shown in Settings, with a sanitized
   diagnostics export for adding more devices without exposing serial numbers,
   device paths, or raw HID values.
@@ -43,6 +43,12 @@ Middle-click either icon to open Settings. When a call is active, right-click
 the microphone icon or call icon to toggle the active call microphone. With no
 active call, right-click the microphone icon for Settings and Exit. Hold Ctrl
 while right-clicking to open that menu even during a call.
+
+When full synchronization is enabled for a vendor adapter with an observable
+latched switch, a physical unmuted state releases Windows mute at startup and
+on later status polls. This can override a mute made through the tray icon,
+Windows, a keyboard shortcut, or another application, and applies to the
+configured default input even when it is a separate desk or XLR microphone.
 
 Windows initially places new notification icons in the overflow area. Open
 **Taskbar settings → Other system tray icons** to promote the microphone and

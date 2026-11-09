@@ -845,8 +845,8 @@ static void QueueHeadsetMute() {
     QueueHeadsetMuteRequest(2);
 }
 
-static void QueueOwnedHeadsetUnmute() {
-    QueueHeadsetMuteRequest(3);
+static void QueueHeadsetUnmute() {
+    QueueHeadsetMuteRequest(1);
 }
 
 static constexpr int kCallNone = -1;
@@ -1090,7 +1090,7 @@ static DWORD WINAPI AudioThreadProc(void*) {
         unsigned muteCommand = static_cast<unsigned>(muteRequest & 3);
         unsigned long long muteDeadline = muteRequest >> 2;
         bool muteRequestExpired =
-            muteCommand == 3 && now > muteDeadline;
+            (muteCommand == 1 || muteCommand == 3) && now > muteDeadline;
         if (muteCommand != 0 && !muteRequestExpired) {
             bool requireOwnedEndpoint = muteCommand == 3;
             bool targetMuted = muteCommand == 2;
@@ -1127,8 +1127,7 @@ static DWORD WINAPI AudioThreadProc(void*) {
             }
         } else {
             if (muteRequestExpired) {
-                RecordDiagnosticEvent(
-                    L"Expired headset-owned unmute request");
+                RecordDiagnosticEvent(L"Expired headset unmute request");
             }
             unsigned toggles = g_pendingMuteToggles.exchange(0);
             if (toggles & 1U) {
@@ -2153,7 +2152,7 @@ static void ResolveStandardHidAction() {
         if (targetMuted)
             QueueHeadsetMute();
         else
-            QueueOwnedHeadsetUnmute();
+            QueueHeadsetUnmute();
     }
     if (g_settings.headsetSyncCalls)
         QueueCallMuteState(targetMuted);
@@ -2408,8 +2407,13 @@ static DWORD WINAPI HeadsetThreadProc(void*) {
                         g_settings.headsetMode == L"muteOnly";
         bool syncUnmute = g_settings.headsetMode == L"full";
         if (observation.muted && syncMute) {
-            if (g_settings.headsetSyncWindows && !g_audioMuted.load())
+            if (g_settings.headsetSyncWindows &&
+                (stateChanged || !g_audioAvailable.load() ||
+                 !g_audioMuted.load())) {
+                // The initial physical state must replace any unmute queued
+                // before the headset finished connecting.
                 QueueHeadsetMute();
+            }
             ULONGLONG now = GetTickCount64();
             if (g_settings.headsetSyncCalls &&
                 (stateChanged || lastVendorCallMuteAssert == 0 ||
@@ -2418,13 +2422,10 @@ static DWORD WINAPI HeadsetThreadProc(void*) {
                 lastVendorCallMuteAssert = now;
             }
         } else if (!observation.muted && syncUnmute) {
-            bool ownershipRelease =
-                !stateTransition && g_windowsMutedByHeadset.load();
-            bool releaseHeadsetMute = stateTransition || ownershipRelease;
-            if (g_settings.headsetSyncWindows && releaseHeadsetMute) {
+            if (g_settings.headsetSyncWindows) {
                 bool audioKnown = g_audioAvailable.load();
                 if (!audioKnown || g_audioMuted.load())
-                    QueueOwnedHeadsetUnmute();
+                    QueueHeadsetUnmute();
                 else
                     ClearHeadsetMuteOwnership();
             }
@@ -3965,9 +3966,9 @@ static void CreateHeadsetPage(HWND window) {
     AddControl(window, L"BUTTON", L"Export headset diagnostics…",
                WS_TABSTOP, 32, 310, 220, 30, IDC_HEADSET_EXPORT, page);
     AddNote(window,
-            L"Synchronization is opt-in. Standard HID and vendor headset "
-            L"monitoring run only while enabled. Windows hardware mute uses "
-            L"Core Audio. Silence is never treated as physical mute.",
+            L"Synchronization is opt-in. In full mode, an observable vendor "
+            L"switch overrides Windows mute; use mute-only or status-only for "
+            L"independent privacy mutes. Silence is never treated as mute.",
             32, 358, 510, 62, page);
 }
 
