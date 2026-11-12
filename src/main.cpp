@@ -2424,10 +2424,13 @@ static DWORD WINAPI HeadsetThreadProc(void*) {
         } else if (!observation.muted && syncUnmute) {
             if (g_settings.headsetSyncWindows) {
                 bool audioKnown = g_audioAvailable.load();
-                if (!audioKnown || g_audioMuted.load())
+                if (stateChanged || !audioKnown || g_audioMuted.load()) {
+                    // Reconcile the first physical state even if the cached
+                    // Windows state predates the newly connected endpoint.
                     QueueHeadsetUnmute();
-                else
+                } else {
                     ClearHeadsetMuteOwnership();
+                }
             }
             if (g_settings.headsetSyncCalls && stateTransition)
                 QueueCallMuteState(false);
