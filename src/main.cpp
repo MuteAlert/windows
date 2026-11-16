@@ -2356,10 +2356,15 @@ static void ApplyStandardHidRegistration() {
 }
 
 static DWORD WINAPI HeadsetThreadProc(void*) {
+    constexpr ULONGLONG kInitialStateSettleMs = 2000;
     auto adapter = CreateSteelSeriesHeadsetAdapter();
     bool connected = false;
     bool known = false;
     bool previousMuted = false;
+    bool candidateKnown = false;
+    bool candidateMuted = false;
+    ULONGLONG candidateSince = 0;
+    unsigned candidateSamples = 0;
     ULONGLONG lastVendorCallMuteAssert = 0;
     while (WaitForSingleObject(g_stopEvent, 0) == WAIT_TIMEOUT &&
            !g_exiting.load()) {
@@ -2373,12 +2378,14 @@ static DWORD WINAPI HeadsetThreadProc(void*) {
             }
             RecordDiagnosticEvent(L"SteelSeries vendor adapter connected");
             known = false;
+            candidateKnown = false;
         }
         HeadsetAdapterObservation observation;
         if (!adapter->Poll(observation)) {
             adapter->Disconnect();
             connected = false;
             known = false;
+            candidateKnown = false;
             UpdateSteelSeriesSource(false, false, L"", L"");
             RecordDiagnosticEvent(
                 L"SteelSeries vendor adapter disconnected after read failure");
@@ -2387,12 +2394,36 @@ static DWORD WINAPI HeadsetThreadProc(void*) {
         }
         if (!observation.available || !observation.stateKnown) {
             known = false;
+            candidateKnown = false;
             UpdateSteelSeriesSource(false, false, L"", L"");
             if (WaitForSingleObject(g_stopEvent,
                                     g_settings.headsetPollInterval) !=
                 WAIT_TIMEOUT)
                 break;
             continue;
+        }
+        ULONGLONG now = GetTickCount64();
+        if (!known) {
+            if (!candidateKnown || candidateMuted != observation.muted) {
+                candidateKnown = true;
+                candidateMuted = observation.muted;
+                candidateSince = now;
+                candidateSamples = 1;
+                RecordDiagnosticEvent(
+                    std::wstring(L"SteelSeries initial state candidate: ") +
+                    (candidateMuted ? L"muted" : L"unmuted"));
+            } else {
+                candidateSamples++;
+            }
+            if (candidateSamples < 2 ||
+                now - candidateSince < kInitialStateSettleMs) {
+                if (WaitForSingleObject(
+                        g_stopEvent, g_settings.headsetPollInterval) !=
+                    WAIT_TIMEOUT)
+                    break;
+                continue;
+            }
+            candidateKnown = false;
         }
         bool stateChanged = !known || observation.muted != previousMuted;
         bool stateTransition = known && observation.muted != previousMuted;
@@ -2414,7 +2445,6 @@ static DWORD WINAPI HeadsetThreadProc(void*) {
                 // before the headset finished connecting.
                 QueueHeadsetMute();
             }
-            ULONGLONG now = GetTickCount64();
             if (g_settings.headsetSyncCalls &&
                 (stateChanged || lastVendorCallMuteAssert == 0 ||
                  now - lastVendorCallMuteAssert >= 5000) &&
