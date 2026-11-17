@@ -771,6 +771,16 @@ static void UpdateWindowsHardwareSource(bool supported, bool muted,
     RecomputeHeadsetStatus();
 }
 
+static std::optional<bool> GetWindowsHardwareMuteState() {
+    AcquireSRWLockShared(&g_headsetStatusLock);
+    std::optional<bool> result;
+    if (g_windowsHardwareMuteSupported) {
+        result = g_windowsHardwareMuted;
+    }
+    ReleaseSRWLockShared(&g_headsetStatusLock);
+    return result;
+}
+
 static void UpdateStandardHidSource(bool detected,
                                     const std::wstring& deviceName,
                                     const std::wstring& detail) {
@@ -2365,6 +2375,9 @@ static DWORD WINAPI HeadsetThreadProc(void*) {
     bool candidateMuted = false;
     ULONGLONG candidateSince = 0;
     unsigned candidateSamples = 0;
+    bool initialStateConflict = false;
+    bool conflictVendorMuted = false;
+    bool conflictHardwareMuted = false;
     ULONGLONG lastVendorCallMuteAssert = 0;
     while (WaitForSingleObject(g_stopEvent, 0) == WAIT_TIMEOUT &&
            !g_exiting.load()) {
@@ -2379,6 +2392,7 @@ static DWORD WINAPI HeadsetThreadProc(void*) {
             RecordDiagnosticEvent(L"SteelSeries vendor adapter connected");
             known = false;
             candidateKnown = false;
+            initialStateConflict = false;
         }
         HeadsetAdapterObservation observation;
         if (!adapter->Poll(observation)) {
@@ -2386,6 +2400,7 @@ static DWORD WINAPI HeadsetThreadProc(void*) {
             connected = false;
             known = false;
             candidateKnown = false;
+            initialStateConflict = false;
             UpdateSteelSeriesSource(false, false, L"", L"");
             RecordDiagnosticEvent(
                 L"SteelSeries vendor adapter disconnected after read failure");
@@ -2395,6 +2410,7 @@ static DWORD WINAPI HeadsetThreadProc(void*) {
         if (!observation.available || !observation.stateKnown) {
             known = false;
             candidateKnown = false;
+            initialStateConflict = false;
             UpdateSteelSeriesSource(false, false, L"", L"");
             if (WaitForSingleObject(g_stopEvent,
                                     g_settings.headsetPollInterval) !=
@@ -2424,6 +2440,30 @@ static DWORD WINAPI HeadsetThreadProc(void*) {
                 continue;
             }
             candidateKnown = false;
+        }
+        bool rawVendorMuted = observation.muted;
+        std::optional<bool> hardwareMuted = GetWindowsHardwareMuteState();
+        if (!known && hardwareMuted && rawVendorMuted != *hardwareMuted) {
+            initialStateConflict = true;
+            conflictVendorMuted = rawVendorMuted;
+            conflictHardwareMuted = *hardwareMuted;
+            observation.muted = conflictHardwareMuted;
+            RecordDiagnosticEvent(
+                std::wstring(L"Initial SteelSeries/Windows hardware state ") +
+                L"conflict; preserving " +
+                (conflictHardwareMuted ? L"muted" : L"unmuted") +
+                L" until an observed state changes");
+        } else if (initialStateConflict) {
+            bool vendorChanged = rawVendorMuted != conflictVendorMuted;
+            bool hardwareChanged =
+                hardwareMuted && *hardwareMuted != conflictHardwareMuted;
+            if (vendorChanged || hardwareChanged) {
+                initialStateConflict = false;
+                RecordDiagnosticEvent(
+                    L"Initial SteelSeries/Windows hardware conflict resolved");
+            } else {
+                observation.muted = conflictHardwareMuted;
+            }
         }
         bool stateChanged = !known || observation.muted != previousMuted;
         bool stateTransition = known && observation.muted != previousMuted;
