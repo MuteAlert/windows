@@ -39,10 +39,10 @@ microphone widget without Windhawk or Explorer injection.
   **Check now** action, verified download-and-install support, and a direct
   link to newer releases.
 
-Middle-click either icon to open Settings. When a call is active, right-click
-the microphone icon or call icon to toggle the active call microphone. With no
-active call, right-click the microphone icon for Settings and Exit. Hold Ctrl
-while right-clicking to open that menu even during a call.
+Right-click the microphone icon for Settings, update information, and Exit.
+The microphone icon never controls call mute. When a call is active,
+right-click the separate call icon to toggle its microphone; middle-clicking
+the call icon also opens Settings.
 
 When full synchronization is enabled for a vendor adapter with an observable
 latched switch, a physical unmuted state releases Windows mute at startup and

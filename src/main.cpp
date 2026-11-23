@@ -3478,9 +3478,7 @@ static std::wstring MicTooltip() {
                       : L"button detected";
     }
     suffix += L"\nLeft: Win mute | Wheel: volume";
-    suffix += !CallList(false).empty()
-                  ? L"\nRight: Toggle call | Middle: settings"
-                  : L"\nMiddle: settings";
+    suffix += L"\nRight: settings";
 
     // NOTIFYICONDATA::szTip holds at most 127 visible characters. Preserve
     // every control instruction and shorten only the device name if needed.
@@ -3939,8 +3937,8 @@ static void CreateGeneralPage(HWND window) {
     AddNote(window,
             L"Left-click the microphone icon to mute Windows input. Scroll "
             L"over it to change volume; while volume lock is enabled, "
-            L"scrolling also updates the forced target. Middle-click either "
-            L"icon to reopen this panel.",
+            L"scrolling also updates the forced target. Right-click the "
+            L"microphone icon to open Settings.",
             32, 382, 520, 62, page);
 }
 
@@ -3952,7 +3950,7 @@ static void CreateCallPage(HWND window, int page, PCWSTR appName, int base,
              88, 400, page);
     AddCheck(window, L"Play an audio cue when the warning begins", base + 1,
              32, 118, 400, page);
-    AddCheck(window, L"Allow taskbar right-click mute/unmute", base + 2, 32,
+    AddCheck(window, L"Allow call-icon right-click mute/unmute", base + 2, 32,
              148, 400, page);
     AddLabel(window, L"Muted-button accessible text", 32, 184, 230, page);
     AddEdit(window, base + 3, 270, 180, 270, page);
@@ -3987,7 +3985,7 @@ static void CreateMeetPage(HWND window) {
              IDC_MEET_WARNING, 32, 82, 510, page);
     AddCheck(window, L"Play audio cue (requires warning above)",
              IDC_MEET_CUE, 32, 110, 510, page);
-    AddCheck(window, L"Allow taskbar right-click mute/unmute",
+    AddCheck(window, L"Allow call-icon right-click mute/unmute",
              IDC_MEET_TOGGLE, 32, 138, 510, page);
     auto field = [&](PCWSTR label, int id, int y, int width) {
         AddLabel(window, label, 32, y + 4, 230, page);
@@ -4610,11 +4608,6 @@ static void ShowTrayMenu(POINT point) {
         AppendMenuW(menu, MF_STRING, IDM_VIEW_UPDATE, label.c_str());
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     }
-    if (!CallList(false).empty()) {
-        AppendMenuW(menu, MF_STRING, IDM_TOGGLE_CALLS,
-                    L"Mute/unmute active call(s)");
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    }
     AppendMenuW(menu, MF_STRING, IDM_SETTINGS, L"Settings…");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, IDM_EXIT, L"Exit");
@@ -4689,7 +4682,7 @@ static void HandleTrayEvent(WPARAM wParam, LPARAM lParam) {
         return;
     }
     if (event == WM_MBUTTONUP) {
-        ShowSettings();
+        if (iconId == kCallIconId) ShowSettings();
         return;
     }
     if (event == WM_CONTEXTMENU || event == WM_RBUTTONUP) {
@@ -4697,9 +4690,6 @@ static void HandleTrayEvent(WPARAM wParam, LPARAM lParam) {
             QueueCallToggles();
             return;
         }
-        if (iconId == kMicIconId && !(GetKeyState(VK_CONTROL) & 0x8000) &&
-            QueueCallToggles())
-            return;
         POINT point{GET_X_LPARAM(wParam), GET_Y_LPARAM(wParam)};
         if (point.x == -1 && point.y == -1) GetCursorPos(&point);
         ShowTrayMenu(point);
