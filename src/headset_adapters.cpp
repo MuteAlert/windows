@@ -89,24 +89,33 @@ public:
             written != sizeof(request))
             return false;
 
-        for (int attempt = 0; attempt < 6; attempt++) {
+        bool foundStatus = false;
+        bool latestMuted = false;
+        bool latestOnline = false;
+        for (int attempt = 0; attempt < 32; attempt++) {
             BYTE response[64]{};
             DWORD read = 0;
-            if (!RunIo(false, response, sizeof(response), 125, &read))
+            DWORD timeout = foundStatus ? 20 : 125;
+            if (!RunIo(false, response, sizeof(response), timeout, &read)) {
+                if (foundStatus) break;
                 return false;
+            }
             if (read < 16 || response[0] != 0x06 || response[1] != 0xB0)
                 continue;
-            if (response[9] > 1) return false;
-            observation.available = response[15] == 0x08;
-            observation.stateKnown = observation.available;
-            observation.muted = response[9] == 1;
-            observation.deviceName = L"SteelSeries Arctis Nova Pro Wireless";
-            wchar_t detail[64];
-            wsprintfW(detail, L"VID 1038 / PID %04X", productId_);
-            observation.detail = detail;
-            return true;
+            foundStatus = true;
+            latestMuted = response[9] != 0;
+            latestOnline = response[15] == 0x08;
         }
-        return false;
+        if (!foundStatus) return false;
+
+        observation.available = latestOnline;
+        observation.stateKnown = latestOnline;
+        observation.muted = latestMuted;
+        observation.deviceName = L"SteelSeries Arctis Nova Pro Wireless";
+        wchar_t detail[64];
+        wsprintfW(detail, L"VID 1038 / PID %04X", productId_);
+        observation.detail = detail;
+        return true;
     }
 
     void Disconnect() override {
